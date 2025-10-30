@@ -31,6 +31,8 @@ pub const ROUND_ADDRESS: Pubkey =
 pub mod app_state;
 pub mod rpc;
 pub mod database;
+pub mod ai;
+pub mod slot_miner;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

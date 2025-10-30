@@ -1,51 +1,30 @@
 
-use std::{str::FromStr, time::Duration};
+use std::{sync::Arc, time::Duration};
 
-use ore_api::{consts::{SPLIT_ADDRESS, TREASURY_ADDRESS}, state::{round_pda, Board, Miner, Round, Treasury}};
-use solana_account_decoder_client_types::UiAccountEncoding;
-use solana_client::{nonblocking::rpc_client::RpcClient, rpc_filter::RpcFilterType};
-use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
-use steel::{AccountDeserialize, Numeric, Pubkey};
+use ore_api::{consts::SPLIT_ADDRESS, sdk::{checkpoint, claim_sol, deploy}, state::{Board, Miner, Round, Treasury, miner_pda, round_pda}};
+use solana_client::{nonblocking::rpc_client::RpcClient};
+use solana_sdk::{commitment_config::CommitmentConfig, message::Message, signature::{Keypair, Signature}, signer::Signer, transaction::Transaction};
+use steel::{AccountDeserialize, Instruction, Numeric};
 use tokio::time::Instant;
+use anyhow::Result;
 
-use crate::{app_state::{AppMiner, AppState}, database::{self, insert_deployments, insert_miner_snapshots, insert_round, insert_treasury, CreateDeployment, CreateMinerSnapshot, CreateTreasury, RoundRow}, BOARD_ADDRESS};
-
-pub struct MinerSnapshot {
-    round_id: u64,
-    miners: Vec<AppMiner>,
-    completed: bool,
-}
+use crate::{BOARD_ADDRESS, app_state::AppState, slot_miner::SlotMiner};
+use crate::ai::HybridPredictor;
 
 pub async fn update_data_system(connection: RpcClient, app_state: AppState) {
     tracing::info!("Starting update_data_system");
-    let db_pool = app_state.db_pool.clone();
+    let mut model = HybridPredictor::new();
+    let mut total = 0;
+    let mut total_win_pred = 0.0;
+    let mut total_win_logic = 0.0;
+    // let mut pred = model.predict_hybrid();
+    let mut pred = model.predict_hybrid();
+    let logic = [0, 1, 2, 4, 5, 6, 7, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24];
+    let mut win = 0;
+    let mut lose = 0;
     tokio::spawn(async move {
-        let mut board_snapshot = false;
-        let mut miners_snapshot = MinerSnapshot {
-            round_id: 0,
-            miners: vec![],
-            completed: false,
-        };
+        let mut last_deployed_round = None;
         loop {
-            let treasury = if let Ok(treasury) = connection.get_account_data(&TREASURY_ADDRESS).await {
-                if let Ok(treasury) = Treasury::try_from_bytes(&treasury) {
-                    treasury.clone()
-                } else {
-                    tracing::error!("Failed to parse Treasury account");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    continue
-                }
-            } else {
-                tracing::error!("Failed to load treasury account data");
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue
-            };
-
-            // update treasury
-            let r = app_state.treasury.clone();
-            let mut l = r.write().await;
-            *l = treasury.into();
-            drop(l);
 
             tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -62,6 +41,89 @@ pub async fn update_data_system(connection: RpcClient, app_state: AppState) {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             };
+
+            if last_deployed_round != Some(board.round_id) {
+                last_deployed_round = Some(board.round_id);
+                println!("round {}", board.round_id);
+                pred = model.predict_hybrid();
+                total += 1;
+                println!("Prediksi : {:?}", pred);
+
+                let amount = if lose >= 1 {
+                    50_000
+                } else {
+                    10_000
+                };
+
+                match try_checkpoint_and_deploy(&connection, board.round_id, amount, &pred, "/Users/jeckhat/gawean/jeckhat/miners/poolminer1.json").await {
+                    Ok(DeployOutcome::Deployed(sig)) => {
+                        // sukses -> tandai last_deployed_round
+                        last_deployed_round = Some(board.round_id);
+                        println!("Deployed for round {} sig {}", board.round_id, sig);
+                    }
+                    Ok(DeployOutcome::Skipped) => {
+                        // kode sebelumnya banyak 'continue' diganti dengan ini
+                        tracing::info!("Skipped deploy attempt for round {} - will retry next loop", board.round_id);
+                        continue; // keep old behavior: lanjut loop utama
+                    }
+                    Err(e) => {
+                        tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
+                        continue;
+                    }
+                }
+
+                match try_checkpoint_and_deploy(&connection, board.round_id, amount, &pred, "/Users/jeckhat/gawean/jeckhat/miners/poolminer3.json").await {
+                    Ok(DeployOutcome::Deployed(sig)) => {
+                        // sukses -> tandai last_deployed_round
+                        last_deployed_round = Some(board.round_id);
+                        println!("Deployed for round {} sig {}", board.round_id, sig);
+                    }
+                    Ok(DeployOutcome::Skipped) => {
+                        // kode sebelumnya banyak 'continue' diganti dengan ini
+                        tracing::info!("Skipped deploy attempt for round {} - will retry next loop", board.round_id);
+                        continue; // keep old behavior: lanjut loop utama
+                    }
+                    Err(e) => {
+                        tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
+                        continue;
+                    }
+                }
+
+                match try_checkpoint_and_deploy(&connection, board.round_id, amount, &pred, "/Users/jeckhat/gawean/jeckhat/miners/mebest.json").await {
+                    Ok(DeployOutcome::Deployed(sig)) => {
+                        // sukses -> tandai last_deployed_round
+                        last_deployed_round = Some(board.round_id);
+                        println!("Deployed for round {} sig {}", board.round_id, sig);
+                    }
+                    Ok(DeployOutcome::Skipped) => {
+                        // kode sebelumnya banyak 'continue' diganti dengan ini
+                        tracing::info!("Skipped deploy attempt for round {} - will retry next loop", board.round_id);
+                        continue; // keep old behavior: lanjut loop utama
+                    }
+                    Err(e) => {
+                        tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
+                        continue;
+                    }
+                }
+
+                match try_checkpoint_and_deploy(&connection, board.round_id, amount, &logic, "/Users/jeckhat/gawean/jeckhat/miners/meminer_1.json").await {
+                    Ok(DeployOutcome::Deployed(sig)) => {
+                        // sukses -> tandai last_deployed_round
+                        last_deployed_round = Some(board.round_id);
+                        println!("Deployed for round {} sig {}", board.round_id, sig);
+                    }
+                    Ok(DeployOutcome::Skipped) => {
+                        // kode sebelumnya banyak 'continue' diganti dengan ini
+                        tracing::info!("Skipped deploy attempt for round {} - will retry next loop", board.round_id);
+                        continue; // keep old behavior: lanjut loop utama
+                    }
+                    Err(e) => {
+                        tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
+                        continue;
+                    }
+                }
+
+            }
 
             // update board
             let r = app_state.board.clone();
@@ -80,301 +142,178 @@ pub async fn update_data_system(connection: RpcClient, app_state: AppState) {
 
             let slots_left_in_round = last_deployable_slot as i64 - current_slot as i64;
 
-            println!("Slots left for round: {}", slots_left_in_round);
             tokio::time::sleep(Duration::from_secs(1)).await;
 
+            let round_key = &round_pda(board.round_id).0;
+
+            let start_wait = Instant::now();
+
             if slots_left_in_round < 0 {
-                if !board_snapshot {
-                    tracing::info!("Updating data");
-                    let round = if let Ok(round) = connection.get_account_data(&round_pda(board.round_id).0).await {
-                        if let Ok(round) = Round::try_from_bytes(&round) {
-                            round.clone()
-                        } else {
-                            tracing::error!("Failed to parse Round account");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            continue;
-                        }
-                    } else {
-                        tracing::error!("Failed to load round account data");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue
-                    };
-
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-
-                    let mut miners: Vec<AppMiner> = vec![];
-                    if let Ok(miners_data_raw) = connection.get_program_accounts_with_config(
-                        &ore_api::id(),
-                        solana_client::rpc_config::RpcProgramAccountsConfig { 
-                            filters: Some(vec![RpcFilterType::DataSize(size_of::<Miner>() as u64 + 8)]),
-                            account_config: solana_client::rpc_config::RpcAccountInfoConfig {
-                                encoding: Some(UiAccountEncoding::Base64),
-                                data_slice: None,
-                                commitment: Some(CommitmentConfig { commitment: CommitmentLevel::Confirmed }),
-                                min_context_slot: None,
-                            },
-                            with_context: None,
-                            sort_results: None
-                        } 
-                    ).await {
-                        for miner_data in miners_data_raw {
-                            if let Ok(miner) = Miner::try_from_bytes(&miner_data.1.data) {
-                                let mut miner = *miner;
-                                miner.refined_ore = infer_refined_ore(&miner, &treasury);
-                                miners.push(miner.clone().into());
-                            }
-                        }
-                    }
-
-                    if miners.len() > 0 {
-                        miners_snapshot.round_id = round.id;
-                        miners_snapshot.miners = miners.clone();
-                        miners_snapshot.completed = false;
-                        miners.sort_by(|a, b| b.rewards_ore.partial_cmp(&a.rewards_ore).unwrap());
-
-                        tracing::info!("Setting miners snapshot completed to false");
-                        
-                    } else {
-                        miners_snapshot.round_id = round.id;
-                        miners_snapshot.miners = vec![];
-                        miners_snapshot.completed = true;
-                        tracing::info!("Setting miners snapshot completed to true");
-                    }
-                    board_snapshot = true;
-                }
-            } else if slots_left_in_round > 0 {
-                board_snapshot = false;
-                tracing::info!("Checking miner snapshot status: {}", miners_snapshot.completed);
-                if !miners_snapshot.completed {
-                    let r_now = Instant::now();
-                    tracing::info!("Performing snapshot and updating round");
-                    // load previous round
-                    let round_id = board.round_id - 1;
-                    let mut round = if let Ok(round) = connection.get_account_data(&round_pda(round_id).0).await {
-                        if let Ok(round) = Round::try_from_bytes(&round) {
-                            round.clone()
-                        } else {
-                            tracing::error!("Failed to parse Round account");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            continue;
-                        }
-                    } else {
-                        tracing::error!("Failed to load round account data");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue
-                    };
-
-
-                    if round.slot_hash == [0; 32] {
-                        tracing::error!("Round slot hash should not be 0's");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    } else if round.slot_hash == [u8::MAX; 32] {
-                        tracing::error!("Round reset failed");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        tracing::error!("");
-                        // Update miners
-                        let r = app_state.miners.clone();
-                        let mut l = r.write().await;
-                        *l = miners_snapshot.miners.clone();
-                        drop(l);
-                        miners_snapshot.completed = true;
-
-                        let mut db_snapshot: Vec<CreateMinerSnapshot> = vec![];
-
-                        for m in miners_snapshot.miners.iter() {
-                            let m = m.clone();
-                            db_snapshot.push(m.into());
-                        }
-
-                        // insert miners
-                        if let Err(e) = insert_miner_snapshots(&db_pool, &db_snapshot).await {
-                            tracing::error!("Failed to insert miners snapshot: {:?}", e);
-                        }
-
-                        // update round
-                        let r = app_state.rounds.clone();
-                        let mut l = r.write().await;
-                        l.push(round.into());
-                        drop(l);
-
-                        // insert round
-                        if let Err(e) = insert_round(&db_pool, &RoundRow::from(round)).await {
-                            tracing::error!("Failed to insert round: {:?}", e);
-                        }
-
-                        // insert treasury
-                        if let Err(e) = insert_treasury(&db_pool, &CreateTreasury::from(treasury)).await {
-                            tracing::error!("Failed to insert treasury: {:?}", e);
-                        }
-                        continue;
-                    } else {
-                        // process round data
-                        if let Some(_r) = round.rng() {
-                            let (winning_square_opt, top_sample_opt, denom_opt) = if let Some(r) = round.rng() {
-                                let winning_square = round.winning_square(r) as usize;
-
-                                // Total deployed on winning square (denominator for pro-rata shares)
-                                let denom = round.deployed[winning_square];
-                                if denom == 0 {
-                                    // Degenerate case: nothing deployed on the winning square → no rewards
-                                    (Some(winning_square), None, Some(denom))
+                let round: Round = loop {
+                    match connection.get_account_data(&round_key).await {
+                        Ok(data) if !data.is_empty() => match Round::try_from_bytes(&data) {
+                            Ok(r_ref) => {
+                                let round_owned = r_ref.clone();
+                                if let Some(rng) = round_owned.rng() {
+                                    tracing::info!(
+                                        "✅ Round {} RNG available after {}s (rng={})",
+                                        board.round_id,
+                                        start_wait.elapsed().as_secs(),
+                                        rng
+                                    );
+                                    break round_owned;
                                 } else {
-                                    // If split, every miner on the winning square shares top_miner_reward pro-rata.
-                                    // If not split, one miner (whose cumulative range contains top_sample) takes it all.
-                                    let top_sample = if round.top_miner == SPLIT_ADDRESS {
-                                        None
-                                    } else {
-                                        Some(round.top_miner_sample(r, winning_square))
-                                    };
-                                    (Some(winning_square), top_sample, Some(denom))
+                                    tracing::info!(
+                                        "⌛ Round {} still missing slot_hash... waiting 5s",
+                                        board.round_id
+                                    );
                                 }
-                            } else {
-                                (None, None, None)
-                            };
-
-                            let mut deployments: Vec<CreateDeployment> = Vec::new();
-
-                            // Convenience captures
-                            let winning_square = winning_square_opt;
-                            let denom = denom_opt.unwrap_or(0);
-                            let is_split = round.top_miner == SPLIT_ADDRESS;
-                            let motherlode_amt = round.motherlode; // you already set this earlier if did_hit_motherlode
-                            let total_winnings = round.total_winnings;
-                            let top_sample = top_sample_opt; // same for all miners if not split
-
-                            for miner in miners_snapshot.miners.iter() {
-                                if miner.round_id == round.id {
-                                     for (square_index, amount) in miner.deployed.iter().enumerate() {
-                                         if *amount == 0 {
-                                             continue;
-                                         }
-
-                                         // Defaults for non-winning squares (or missing RNG)
-                                         let mut sol_earned_u64: u64 = 0;
-                                         let mut ore_earned_u64: u64 = 0;
-
-                                         // Only compute rewards on the winning square and when we had RNG
-                                         if let Some(ws) = winning_square {
-                                             if square_index == ws && denom > 0 {
-                                                 // ---- SOL rewards ----
-                                                 // Base = original_deployment - admin_fee (admin_fee = max(1, original/100))
-                                                 let original = *amount as u64;
-                                                 let admin_fee = (original / 100).max(1);
-                                                 let mut rewards_sol = original.saturating_sub(admin_fee);
-
-                                                 // Pro-rata share of round.total_winnings
-                                                 let share = ((total_winnings as u128 * original as u128) / denom as u128) as u64;
-                                                 rewards_sol = rewards_sol.saturating_add(share);
-
-                                                 sol_earned_u64 = rewards_sol;
-
-                                                 // ---- ORE rewards ----
-                                                 // Top miner reward: split evenly pro-rata if split, else winner-takes-all by sample
-                                                 if is_split {
-                                                     let split_share = ((round.top_miner_reward as u128 * original as u128)
-                                                         / denom as u128) as u64;
-                                                     ore_earned_u64 = ore_earned_u64.saturating_add(split_share);
-                                                 } else if let Some(sample) = top_sample {
-                                                     // Check if this miner's cumulative interval covers the sample
-                                                     let start = miner.cumulative[ws];
-                                                     let end = start.saturating_add(original);
-                                                     if sample >= start && sample < end {
-                                                         ore_earned_u64 = ore_earned_u64.saturating_add(round.top_miner_reward);
-                                                         round.top_miner = Pubkey::from_str(&miner.authority).unwrap();
-                                                     }
-                                                 }
-
-                                                 // Motherlode reward (if any)
-                                                 if motherlode_amt > 0 {
-                                                     let ml_share = ((motherlode_amt as u128 * original as u128)
-                                                         / denom as u128) as u64;
-                                                     ore_earned_u64 = ore_earned_u64.saturating_add(ml_share);
-                                                 }
-                                             }
-                                         }
-
-                                         let deployment = CreateDeployment {
-                                             round_id: miner.round_id as i64,
-                                             pubkey: miner.authority.to_string(),
-                                             square_id: square_index as i64,
-                                             amount: *amount as i64,
-                                             sol_earned: sol_earned_u64 as i64,
-                                             ore_earned: ore_earned_u64 as i64,
-                                             unclaimed_ore: miner.rewards_ore as i64,
-                                             created_at: chrono::Utc::now().to_rfc3339(),
-                                         };
-
-                                         deployments.push(deployment);
-                                     }
-                                }
-
                             }
-
-                            if let Err(e) = insert_deployments(&db_pool, &deployments).await {
-                                tracing::error!("Failed to insert deployments: {:?}", e);
+                            Err(e) => {
+                                tracing::warn!(
+                                    "⚠️ Failed to parse Round {}: {:?}, retrying in 5s...",
+                                    board.round_id,
+                                    e
+                                );
                             }
+                        },
+                        Ok(_) => {
+                            tracing::info!(
+                                "ℹ️ Round account {} empty, waiting 5s...",
+                                board.round_id
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "⚠️ RPC error fetching round {}: {:?}, retrying in 5s...",
+                                board.round_id,
+                                e
+                            );
+                        } 
+                    }
+            
+                    tokio::time::sleep(Duration::from_secs(5)).await; // <== POLL SETIAP 5 DETIK
+                };
+                
+                // compute rng once and branch on it
+                if let Some(rng) = round.rng() {
+                    // winning square (0..24)
+                    let winning_square = round.winning_square(rng) as usize;
+                
+                    // debug logging
+                    tracing::info!("Round {} RNG present. rng={} winning_square={}", round.id, rng, winning_square);
+                
+                    // check whether our prediction hit
+                    let hit_pred = pred.contains(&winning_square);
+                    let hit_logic = logic.contains(&winning_square);
+                    println!("Prediksi  : {:?}", pred);
+                    println!("Win Block : {}", winning_square);
+                    println!("Hasil AI  : {}", if hit_pred { "✅ BENAR" } else { "❌ SALAH" });
+                    println!("Hasil ME  : {}", if hit_logic { "✅ BENAR" } else { "❌ SALAH" });
+                    
+                    if hit_pred {
+                        total_win_pred += 1.0;
+                        win += 1;
+                        if lose > 0 {
+                            lose -= 1;
+                        }
+                    } else {
+                        lose += 1;
+                        win = 0;
+                    }
 
+                    if hit_logic {
+                        total_win_logic += 1.0;
+                    }
+                    println!("WR AI  : {:.2}%", ((total_win_pred as f64 / total as f64) * 100.0));
+                    println!("WR ME  : {:.2}%", ((total_win_logic as f64 / total as f64) * 100.0));
 
-                        } else {
-                            tracing::error!("Failed to get round rng.");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            continue
+                    if win > 1 {
+                        win = 0;
+                        match try_claim_sol(&connection, "/Users/jeckhat/gawean/jeckhat/miners/poolminer1.json").await {
+                            Ok(DeployOutcome::Deployed(sig)) => {
+                                tracing::info!("Claim submitted: {}", sig);
+                            }
+                            Ok(DeployOutcome::Skipped) => {
+                                // kode sebelumnya banyak 'continue' diganti dengan ini
+                                tracing::info!("Skipped claim attempt for round {} - will retry next loop", board.round_id);
+                                continue; // keep old behavior: lanjut loop utama
+                            }
+                            Err(e) => {
+                                tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
+                                continue;
+                            }
+                        }
+
+                        match try_claim_sol(&connection, "/Users/jeckhat/gawean/jeckhat/miners/poolminer3.json").await {
+                            Ok(DeployOutcome::Deployed(sig)) => {
+                                tracing::info!("Claim submitted: {}", sig);
+                            }
+                            Ok(DeployOutcome::Skipped) => {
+                                // kode sebelumnya banyak 'continue' diganti dengan ini
+                                tracing::info!("Skipped claim attempt for round {} - will retry next loop", board.round_id);
+                                continue; // keep old behavior: lanjut loop utama
+                            }
+                            Err(e) => {
+                                tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
+                                continue;
+                            }
+                        }
+
+                        match try_claim_sol(&connection, "/Users/jeckhat/gawean/jeckhat/miners/mebest.json").await {
+                            Ok(DeployOutcome::Deployed(sig)) => {
+                                tracing::info!("Claim submitted: {}", sig);
+                            }
+                            Ok(DeployOutcome::Skipped) => {
+                                // kode sebelumnya banyak 'continue' diganti dengan ini
+                                tracing::info!("Skipped claim attempt for round {} - will retry next loop", board.round_id);
+                                continue; // keep old behavior: lanjut loop utama
+                            }
+                            Err(e) => {
+                                tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
+                                continue;
+                            }
+                        }
+
+                        match try_claim_sol(&connection, "/Users/jeckhat/gawean/jeckhat/miners/meminer_1.json").await {
+                            Ok(DeployOutcome::Deployed(sig)) => {
+                                tracing::info!("Claim submitted: {}", sig);
+                            }
+                            Ok(DeployOutcome::Skipped) => {
+                                // kode sebelumnya banyak 'continue' diganti dengan ini
+                                tracing::info!("Skipped claim attempt for round {} - will retry next loop", board.round_id);
+                                continue; // keep old behavior: lanjut loop utama
+                            }
+                            Err(e) => {
+                                tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
+                                continue;
+                            }
                         }
                         
-                        // Update miners
-                        let r = app_state.miners.clone();
-                        let mut l = r.write().await;
-                        *l = miners_snapshot.miners.clone();
-                        drop(l);
-
-                        let mut db_snapshot: Vec<CreateMinerSnapshot> = vec![];
-
-                        for m in miners_snapshot.miners.iter() {
-                            let m = m.clone();
-                            db_snapshot.push(m.into());
-                        }
-
-                        // insert miners
-                        if let Err(e) = insert_miner_snapshots(&db_pool, &db_snapshot).await {
-                            tracing::error!("Failed to insert miners snapshot: {:?}", e);
-                        }
-
-
-                        // update round
-                        let r = app_state.rounds.clone();
-                        let mut l = r.write().await;
-                        l.push(round.into());
-                        drop(l);
-
-                        // insert round
-                        if let Err(e) = insert_round(&db_pool, &RoundRow::from(round)).await {
-                            tracing::error!("Failed to insert round: {:?}", e);
-                        }
-
-                        // insert treasury
-                        if let Err(e) = insert_treasury(&db_pool, &CreateTreasury::from(treasury)).await {
-                            tracing::error!("Failed to insert treasury: {:?}", e);
-                        }
-
-
-                        if let Err(e) = database::finalize_round_idempotent(&db_pool, round.id as i64).await {
-                            tracing::error!("Failed to finalize for round: {:?}", e);
-                        }
-
-                        tracing::info!("Successfully snapshot round and updated database in {}ms", r_now.elapsed().as_millis());
-                        miners_snapshot.completed = true;
                     }
-                }
-
-
-
-                let sleep_time = slots_left_in_round as u64 * 400;
-                println!("Sleeping until round is over in {} ms", sleep_time + 5000);
-                tokio::time::sleep(Duration::from_millis(sleep_time)).await;
+                
+                    model.update(winning_square, &pred);
+                    println!("accuracy: {:.2}%", model.accuracy());
+                    println!("Total Winners: {}", total);
+                
+                    // denom: total deployed on the winning square
+                    let denom = round.deployed[winning_square];
+                    if denom == 0 {
+                        (Some(winning_square), None, Some(denom))
+                    } else {
+                        let top_sample = if round.top_miner == SPLIT_ADDRESS {
+                            None
+                        } else {
+                            Some(round.top_miner_sample(rng, winning_square))
+                        };
+                        (Some(winning_square), top_sample, Some(denom))
+                    }
+                } else {
+                    // no RNG available
+                    tracing::error!("Failed to get round rng for round {}", round.id);
+                    (None, None, None)
+                };
             } else {
-                board_snapshot = false;
-                println!("Sleeping for 5 seconds");
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
 
@@ -402,6 +341,395 @@ pub fn refinement_level_percent(refined_ore: f64, unclaimed_ore: f64) -> f64 {
         }
     } else {
         -10.0 + 100.0 * (refined_ore / unclaimed_ore)
+    }
+}
+
+// pub async fn set_plan_miner(path: String, board: Board, pred: Vec<usize>) {
+// let miner_path = Arc::new(SlotMiner::new(Some(String::from(path))));
+// let signer_kp: Keypair = miner_path.signer();
+// let signer_pubkey = signer_kp.pubkey();
+
+// // compute miner PDA for this authority
+// let miner_adr = miner_pda(signer_pubkey).0;
+
+// // fetch miner on-chain (if exists)
+// let mut miner_data: Option<Miner> = match connection.get_account_with_commitment(&miner_adr, CommitmentConfig::confirmed()).await {
+//     Ok(resp) => {
+//         if let Some(acc) = resp.value {
+//             match Miner::try_from_bytes(&acc.data) {
+//                 Ok(m) => {
+//                     Some(m.clone())
+//                 }
+//                 Err(_) => {
+//                     tracing::error!("Failed to parse Miner account data");
+//                     None
+//                 }
+//             }
+//         } else {
+//             tracing::info!("Miner account {} not found on-chain (will attempt checkpoint-create)", miner_adr);
+//             None
+//         }
+//     }
+//     Err(e) => {
+//         tracing::error!("RPC error fetching miner account: {:?}", e);
+//         None
+//     }
+// };
+
+// // build squares from prediction
+// let mut squares: [bool; 25] = [false; 25];
+// for &idx in pred.iter() {
+//     if idx < squares.len() {
+//         squares[idx] = true;
+//     } else {
+//         tracing::warn!("Pred index out of range (ignored): {}", idx);
+//     }
+// }
+
+// let mut ixs: Vec<Instruction> = Vec::new();
+
+// if let Some(ref m) = miner_data {
+//     // If the on-chain rule requires m.checkpoint_id == m.round_id,
+//     // we must checkpoint with m.round_id and only if checkpoint_id != round_id.
+//     let miner_round_id = m.round_id;
+//     let need_checkpoint = m.checkpoint_id != miner_round_id;
+
+//     if need_checkpoint {
+//         tracing::info!("Miner exists but not checkpointed for its own round (miner.round_id = {}, miner.checkpoint_id = {}), adding checkpoint({})",
+//                       miner_round_id, m.checkpoint_id, miner_round_id);
+//         ixs.push(checkpoint(signer_pubkey, signer_pubkey, miner_round_id));
+//     } else {
+//         tracing::info!("Miner already checkpointed for its own round: {}", miner_round_id);
+//     }
+// } else {
+//     // Miner account missing: we don't have m.round_id to use.
+//     // Fallback: attempt checkpoint using board.round_id (this will initialize the miner
+//     // if the program supports creating miner on first checkpoint). If your program
+//     // requires a different behavior (e.g. specific initial round_id), change accordingly.
+//     tracing::info!("Miner account missing; attempting checkpoint(create) using board.round_id = {}", board.round_id);
+//     ixs.push(checkpoint(signer_pubkey, signer_pubkey, board.round_id));
+// }
+
+// // push deploy instruction always (we either checkpoint+deploy in same tx or only deploy)
+// ixs.push(deploy(
+//     signer_pubkey,
+//     signer_pubkey,
+//     10_000,
+//     board.round_id,
+//     squares,
+// ));
+
+// // get recent blockhash
+// let recent_blockhash = match connection.get_latest_blockhash().await {
+//     Ok(bh) => bh,
+//     Err(e) => {
+//         tracing::error!("Failed to get recent blockhash for deploy: {:?}", e);
+//         tokio::time::sleep(Duration::from_secs(5)).await;
+//         continue;
+//     }
+// };
+
+// // build message & tx containing all instructions (atomic)
+// let message = Message::new(&ixs, Some(&signer_pubkey_1));
+// let mut tx = Transaction::new_unsigned(message);
+// if let Err(e) = tx.try_sign(&[&signer_kp_1], recent_blockhash) {
+//     tracing::error!("Failed to sign transaction: {:?}", e);
+//     continue;
+// }
+
+// // send & confirm
+// let sig = match connection.send_and_confirm_transaction(&tx).await {
+//     Ok(sig) => {
+//         println!("Transaction sent. Signature: {}", sig);
+//         tracing::info!("Sent tx: {}", sig);
+//         sig
+//     }
+//     Err(e) => {
+//         tracing::error!("Failed to send tx: {:?}", e);
+//         // allow retry next loop
+//         continue;
+//     }
+// };
+
+// // // fetch tx meta & program logs for debugging
+// // match connection.get_transaction(&sig).await {
+// //     Ok(Some(txinfo)) => {
+// //         if let Some(meta) = txinfo.transaction.meta {
+// //             tracing::info!("Tx status: {:?}", meta.status);
+// //             if let Some(logs) = meta.log_messages {
+// //                 tracing::info!("Program logs:\n{}", logs.join("\n"));
+// //             }
+// //         } else {
+// //             tracing::warn!("No meta returned for tx {}", sig);
+// //         }
+// //     }
+// //     Ok(None) => tracing::warn!("get_transaction returned None for sig {}", sig),
+// //     Err(e) => tracing::error!("Failed to fetch tx info for {}: {:?}", sig, e),
+// // }
+
+// // After tx finalized, re-fetch miner with finalized commitment to verify checkpoint applied
+// // (give a short delay to let validator index it)
+// tokio::time::sleep(Duration::from_millis(1200)).await;
+// match connection.get_account_with_commitment(&miner_adr, CommitmentConfig::finalized()).await {
+//     Ok(resp) => {
+//         if let Some(acc) = resp.value {
+//             match Miner::try_from_bytes(&acc.data) {
+//                 Ok(miner_after) => {
+//                     tracing::info!("Miner after tx: checkpoint_id = {}", miner_after.checkpoint_id);
+//                     // if miner has checkpointed for this round then mark as deployed
+//                     if miner_after.checkpoint_id == board.round_id {
+//                         last_deployed_round = Some(board.round_id);
+//                     } else {
+//                         // if checkpoint not applied but deploy maybe applied — still mark as deployed
+//                         // But safer: only mark if miner checkpoint == board.round_id
+//                         tracing::warn!("Miner checkpoint_id after tx is {}, expected {}", miner_after.checkpoint_id, board.round_id);
+//                         // If you want to be conservative, don't set last_deployed_round here
+//                     }
+//                 }
+//                 Err(_) => tracing::warn!("Failed to parse miner after tx"),
+//             }
+//         } else {
+//             tracing::warn!("Miner account not found after tx (miner_adr={})", miner_adr);
+//         }
+//     }
+//     Err(e) => tracing::error!("Failed to re-fetch miner after tx: {:?}", e),
+// }
+// }
+
+enum DeployOutcome {
+    Deployed(Signature), // sukses, kembalikan signature
+    Skipped,             // tidak jadi deploy -> lanjut loop utama (sama efek dengan `continue`)
+}
+
+async fn try_checkpoint_and_deploy(
+    connection: &RpcClient,
+    board_round: u64,
+    amount: u64,
+    pred: &[usize],
+    keyfile_path: &str,
+) -> Result<DeployOutcome> {
+    // 1) create signer/miner
+    let miner = Arc::new(SlotMiner::new(Some(keyfile_path.to_string())));
+    let signer_kp: Keypair = miner.signer();
+    let signer_pubkey = signer_kp.pubkey();
+
+    // 2) miner PDA & fetch miner on-chain (owned)
+    let miner_adr = miner_pda(signer_pubkey).0;
+    let miner_data: Option<Miner> = match connection
+        .get_account_with_commitment(&miner_adr, CommitmentConfig::confirmed())
+        .await
+    {
+        Ok(resp) => {
+            if let Some(acc) = resp.value {
+                if acc.data.is_empty() {
+                    tracing::info!("Miner account {} exists but empty.", miner_adr);
+                    None
+                } else {
+                    match Miner::try_from_bytes(&acc.data) {
+                        Ok(m_ref) => Some(m_ref.clone()),
+                        Err(e) => {
+                            tracing::error!("Failed parse miner {}: {:?}", miner_adr, e);
+                            None
+                        }
+                    }
+                }
+            } else {
+                tracing::info!("Miner account {} not found; will attempt checkpoint-create", miner_adr);
+                None
+            }
+        }
+        Err(e) => {
+            tracing::error!("RPC error fetching miner {}: {:?}", miner_adr, e);
+            // jika RPC error, skip iterasi supaya loop utama bisa retry
+            return Ok(DeployOutcome::Skipped);
+        }
+    };
+
+    // 3) build squares dari pred
+    let mut squares: [bool; 25] = [false; 25];
+    for &idx in pred.iter() {
+        if idx < squares.len() {
+            squares[idx] = true;
+        } else {
+            tracing::warn!("Pred out of range: {}", idx);
+        }
+    }
+
+    // 4) decide checkpoint instruction(s)
+    let mut ixs: Vec<Instruction> = Vec::new();
+    if let Some(ref m) = miner_data {
+        // peraturan di program: m.checkpoint_id == m.round_id diperlukan
+        let miner_round_id = m.round_id;
+        if m.checkpoint_id != miner_round_id {
+            tracing::info!("Adding checkpoint(miner_round_id={})", miner_round_id);
+            ixs.push(checkpoint(signer_pubkey, signer_pubkey, miner_round_id));
+        } else {
+            tracing::info!("Miner already checkpointed for its round {}", miner_round_id);
+        }
+    } else {
+        // miner missing -> attempt checkpoint using board round (init)
+        tracing::info!("Miner missing -> checkpoint(board_round={})", board_round);
+        ixs.push(checkpoint(signer_pubkey, signer_pubkey, board_round));
+    }
+
+    // always add deploy
+    ixs.push(deploy(signer_pubkey, signer_pubkey, amount, board_round, squares));
+
+    // 5) get blockhash (jika gagal -> skip iterasi)
+    let recent_blockhash = match connection.get_latest_blockhash().await {
+        Ok(bh) => bh,
+        Err(e) => {
+            tracing::error!("Failed to get recent blockhash: {:?}", e);
+            return Ok(DeployOutcome::Skipped);
+        }
+    };
+
+    // 6) build/sign/send tx
+    let message = Message::new(&ixs, Some(&signer_pubkey));
+    let mut tx = Transaction::new_unsigned(message);
+
+    if let Err(e) = tx.try_sign(&[&signer_kp], recent_blockhash) {
+        tracing::error!("Failed to sign tx: {:?}", e);
+        return Ok(DeployOutcome::Skipped);
+    }
+
+    match connection.send_and_confirm_transaction(&tx).await {
+        Ok(sig) => {
+            tracing::info!("Tx sent: {}", sig);
+            // re-fetch miner finalized (cek checkpoint id) — jika mau
+            // sleep sebentar agar validator index
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            match connection.get_account_with_commitment(&miner_adr, CommitmentConfig::finalized()).await {
+                Ok(resp) => {
+                    if let Some(acc) = resp.value {
+                        if !acc.data.is_empty() {
+                            if let Ok(miner_after) = Miner::try_from_bytes(&acc.data) {
+                                tracing::info!("Miner after tx: checkpoint_id={}", miner_after.checkpoint_id);
+                                // jika ingin sangat aman: hanya treat sebagai deployed jika checkpoint_id == board_round
+                                // tapi kita tetap kembalikan signature karena tx sukses
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("Failed to re-fetch miner after tx: {:?}", e),
+            }
+
+            return Ok(DeployOutcome::Deployed(sig));
+        }
+        Err(e) => {
+            tracing::error!("Failed to send tx: {:?}", e);
+            return Ok(DeployOutcome::Skipped);
+        }
+    }
+}
+
+async fn try_claim_sol(
+    connection: &RpcClient,
+    keyfile_path: &str
+) -> Result<DeployOutcome> {
+    let miner = Arc::new(SlotMiner::new(Some(keyfile_path.to_string())));
+    let signer_kp = miner.signer();
+    let signer_pubkey = signer_kp.pubkey();
+
+    // Compute miner PDA
+    let miner_adr = ore_api::state::miner_pda(signer_pubkey).0;
+
+    // Fetch miner account (confirmed)
+    let miner_opt: Option<Miner> = match connection
+        .get_account_with_commitment(&miner_adr, CommitmentConfig::confirmed())
+        .await
+    {
+        Ok(resp) => {
+            if let Some(acc) = resp.value {
+                if acc.data.is_empty() {
+                    tracing::info!("Miner account {} exists but data empty", miner_adr);
+                    None
+                } else {
+                    match Miner::try_from_bytes(&acc.data) {
+                        Ok(m_ref) => Some(m_ref.clone()), // clone into owned Miner
+                        Err(e) => {
+                            tracing::error!("Failed to deserialize Miner {}: {:?}", miner_adr, e);
+                            None
+                        }
+                    }
+                }
+            } else {
+                tracing::info!("Miner account {} not found on-chain", miner_adr);
+                None
+            }
+        }
+        Err(e) => {
+            tracing::error!("RPC error fetching miner {}: {:?}", miner_adr, e);
+            // Treat as transient: return Err so caller can decide (or return Ok(None) to skip)
+            return Err(anyhow::anyhow!("RPC error fetching miner: {:?}", e));
+        }
+    };
+
+    // If miner doesn't exist -> nothing to claim
+    let miner = match miner_opt {
+        Some(m) => m,
+        None => {
+            tracing::info!("No miner account / no data => nothing to claim");
+            return Ok(DeployOutcome::Skipped);
+        }
+    };
+
+    // If miner.rewards_sol == 0 -> nothing to claim
+    if miner.rewards_sol == 0 {
+        tracing::info!(
+            "Miner {} has 0 rewards_sol -> skipping claim",
+            signer_pubkey
+        );
+        return Ok(DeployOutcome::Skipped);
+    }
+
+    // Build claim instruction (from ore crate)
+    let ix: Instruction = claim_sol(signer_pubkey);
+
+    // Get recent blockhash
+    let recent_blockhash = match connection.get_latest_blockhash().await {
+        Ok(bh) => bh,
+        Err(e) => {
+            tracing::error!("Failed to get recent blockhash for claim: {:?}", e);
+            return Err(anyhow::anyhow!("Failed to get recent blockhash: {:?}", e));
+        }
+    };
+
+    // Create message & transaction
+    let message = Message::new(&[ix], Some(&signer_pubkey));
+    let mut tx = Transaction::new_unsigned(message);
+
+    if let Err(e) = tx.try_sign(&[&signer_kp], recent_blockhash) {
+        tracing::error!("Failed to sign claim transaction: {:?}", e);
+        return Err(anyhow::anyhow!("Failed to sign claim tx: {:?}", e));
+    }
+
+    // Send & confirm
+    match connection.send_and_confirm_transaction(&tx).await {
+        Ok(sig) => {
+            tracing::info!("Claim SOL tx sent for {}: {}", signer_pubkey, sig);
+            // optional: wait a bit then re-fetch miner to confirm rewards_sol updated/cleared
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            match connection.get_account_with_commitment(&miner_adr, CommitmentConfig::finalized()).await {
+                Ok(resp) => {
+                    if let Some(acc) = resp.value {
+                        if !acc.data.is_empty() {
+                            if let Ok(miner_after) = Miner::try_from_bytes(&acc.data) {
+                                tracing::info!("Miner after claim: rewards_sol = {}", miner_after.rewards_sol);
+                                // optionally update DB/state here
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("Failed to re-fetch miner after claim: {:?}", e),
+            }
+
+            Ok(DeployOutcome::Deployed(sig))
+        }
+        Err(e) => {
+            tracing::error!("Failed to send claim tx: {:?}", e);
+            Err(anyhow::anyhow!("Failed to send claim tx: {:?}", e))
+        }
     }
 }
 
