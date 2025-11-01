@@ -14,7 +14,7 @@ use steel::{AccountDeserialize, Pubkey};
 use tokio::{signal, sync::{Mutex, RwLock}};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::{app_state::{AppBoard, AppMiner, AppRound, AppState, AppTreasury}, database::{get_deployments_by_round, CreateDeployment, DbMinerSnapshot, DbTreasury, MinerLeaderboardRow, MinerOreLeaderboardRow, MinerTotalsRow, RoundRow}, rpc::{infer_refined_ore, update_data_system}};
+use crate::{app_state::{AppBoard, AppMiner, AppRound, AppState, AppTreasury}, database::{CreateDeployment, DbMinerSnapshot, DbTreasury, MinerLeaderboardRow, MinerOreLeaderboardRow, MinerTotalsRow, RoundRow, get_deployments_by_round}, rpc::{infer_refined_ore, update_data_system, update_data_system_all}};
 
 /// Program id for const pda derivations
 const PROGRAM_ID: [u8; 32] = unsafe { *(&ore_api::id() as *const Pubkey as *const [u8; 32]) };
@@ -33,6 +33,8 @@ pub mod rpc;
 pub mod database;
 pub mod ai;
 pub mod slot_miner;
+pub mod ore_env;
+pub mod ev;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -143,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let s = app_state.clone();
-    update_data_system(connection, s).await;
+    update_data_system_all(connection, s).await;
 
     let state = app_state.clone();
 

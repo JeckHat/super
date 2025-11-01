@@ -1,6 +1,9 @@
 
 use rand::prelude::*;
+use rand::distributions::WeightedIndex;
 use std::{cmp::Ordering, collections::HashSet};
+
+use crate::{ev::compute_ev_star_for_block, ore_env::OreEnv};
 
 pub struct HybridPredictor {
     counts: Vec<f64>,      // frekuensi dasar
@@ -374,6 +377,153 @@ impl HybridPredictor {
         alt3.sort_unstable();
 
         (alt1, alt2, alt3)
+    }
+
+    pub fn predict_two_alt(&self) -> (Vec<usize>, Vec<usize>) {
+        const K: usize = 18;
+        let mut rng = thread_rng();
+
+        // --- 1️⃣ ALT1: dari EC/Hybrid ---
+        let mut alt1 = self.predict_hybrid(); // kamu bisa ganti ke predict_ec() jika mau
+        alt1.sort_unstable();
+        alt1.dedup();
+        // pastikan panjang = 18
+        if alt1.len() > K {
+            alt1.truncate(K);
+        } else if alt1.len() < K {
+            let probs = self.probabilities();
+            let mut freq_idx: Vec<(usize, f64)> = probs.iter().cloned().enumerate().collect();
+            freq_idx.sort_by(|a, b| b.1.total_cmp(&a.1));
+            for (i, _) in freq_idx.iter() {
+                if alt1.len() >= K { break; }
+                if !alt1.contains(i) {
+                    alt1.push(*i);
+                }
+            }
+        }
+
+        // --- 2️⃣ ALT2: semua angka yang tidak ada di ALT1 ---
+        let used1: HashSet<usize> = alt1.iter().copied().collect();
+        let mut alt2: Vec<usize> = (0..25).filter(|i| !used1.contains(i)).collect();
+
+        // --- 3️⃣ Isi sisa sampai 18 dengan probabilitas frekuensi ---
+        let probs = self.probabilities();
+        while alt2.len() < K {
+            // kandidat = semua angka 0..25 yang belum ada di alt2
+            let candidates: Vec<usize> = (0..25).filter(|i| !alt2.contains(i)).collect();
+            let weights: Vec<f64> = candidates.iter().map(|&i| probs[i]).collect();
+
+            // jika semua bobot nol → uniform
+            let dist = if weights.iter().all(|w| *w <= 0.0) {
+                WeightedIndex::new(vec![1.0f64; candidates.len()]).unwrap()
+            } else {
+                WeightedIndex::new(weights).unwrap()
+            };
+
+            let idx = dist.sample(&mut rng);
+            let chosen = candidates[idx];
+            if !alt2.contains(&chosen) {
+                alt2.push(chosen);
+            }
+        }
+
+        // --- 4️⃣ Sort agar rapi (opsional) ---
+        alt1.sort_unstable();
+        alt2.sort_unstable();
+
+        (alt1, alt2)
+    }
+
+    pub fn predict_with_env(&self, env: &OreEnv, alpha: f64) -> Vec<usize> {
+        let probs = self.probabilities();
+        let mut ev_values = vec![0.0; 25];
+    
+        for i in 0..25 {
+            ev_values[i] = compute_ev_star_for_block(env.os[i], env.total_t, env.ore_value_in_sol).ev;
+        }
+    
+        let min_ev = ev_values.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let max_ev = ev_values.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let norm_ev: Vec<f64> = ev_values
+            .iter()
+            .map(|&e| if max_ev > min_ev { (e - min_ev) / (max_ev - min_ev) } else { 0.0 })
+            .collect();
+    
+        let mut scores: Vec<(usize, f64)> = (0..25)
+            .map(|i| {
+                let s = alpha * probs[i] + (1.0 - alpha) * norm_ev[i];
+                (i, s)
+            })
+            .collect();
+    
+        scores.sort_by(|a, b| b.1.total_cmp(&a.1));
+        scores.iter().take(18).map(|(i, _)| *i).collect()
+    }
+
+    pub fn predict_two_alt_with_ev(
+        &self,
+        env: &OreEnv,
+        alpha: f64,
+        ev_threshold: f64, // threshold untuk eliminasi slot (misal 0.0)
+    ) -> ((Vec<usize>, f64), (Vec<usize>, f64)) {
+        let (alt1, alt2) = self.predict_two_alt();
+        let probs = self.probabilities();
+    
+        // --- 1️⃣ Hitung EV tiap slot dari kondisi environment ---
+        let mut ev_values = vec![0.0; 25];
+        for i in 0..25 {
+            ev_values[i] = compute_ev_star_for_block(env.os[i], env.total_t, env.ore_value_in_sol).ev;
+        }
+    
+        // --- 2️⃣ Normalisasi EV ke skala [0, 1] agar sebanding dengan probabilitas ---
+        let min_ev = ev_values.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let max_ev = ev_values.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let norm_ev: Vec<f64> = ev_values
+            .iter()
+            .map(|&e| {
+                if max_ev > min_ev {
+                    (e - min_ev) / (max_ev - min_ev)
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+    
+        // --- 3️⃣ Fungsi bantu: hitung EV hybrid + filter ---
+        let calc_ev_and_filter = |subset: &Vec<usize>| -> (Vec<usize>, f64) {
+            // 3a. Hitung hybrid score per-slot
+            let mut slot_scores: Vec<(usize, f64)> = subset
+                .iter()
+                .map(|&i| {
+                    let hybrid = alpha * probs[i] + (1.0 - alpha) * norm_ev[i];
+                    (i, hybrid)
+                })
+                .collect();
+    
+            // 3b. Filter slot yang EV-nya di bawah threshold
+            slot_scores.retain(|(i, _)| ev_values[*i] > ev_threshold);
+    
+            // 3c. Urutkan descending (opsional)
+            slot_scores.sort_by(|a, b| b.1.total_cmp(&a.1));
+    
+            // 3d. Ambil indeks final
+            let filtered: Vec<usize> = slot_scores.iter().map(|(i, _)| *i).collect();
+    
+            // 3e. Hitung rata-rata EV hybrid subset yang tersisa
+            let avg_ev = if filtered.is_empty() {
+                0.0
+            } else {
+                filtered.iter().map(|&i| slot_scores.iter().find(|(idx, _)| *idx == i).unwrap().1).sum::<f64>() / (filtered.len() as f64)
+            };
+    
+            (filtered, avg_ev)
+        };
+    
+        // --- 4️⃣ Hitung hasil final untuk alt1 & alt2 ---
+        let (filtered1, ev1) = calc_ev_and_filter(&alt1);
+        let (filtered2, ev2) = calc_ev_and_filter(&alt2);
+    
+        ((filtered1, ev1), (filtered2, ev2))
     }
 
 }
