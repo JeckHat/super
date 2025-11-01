@@ -745,6 +745,12 @@ pub async fn update_data_system_all(connection: RpcClient, app_state: AppState) 
     let logic = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24];
     let mut win = 0;
     let mut lose = 0;
+    let paths = [
+        "/Users/jeckhat/gawean/jeckhat/miners/poolminer1.json",
+        "/Users/jeckhat/gawean/jeckhat/miners/poolminer3.json",
+        "/Users/jeckhat/gawean/jeckhat/miners/mebest.json",
+        "/Users/jeckhat/gawean/jeckhat/miners/meminer_1.json"
+    ];
     tokio::spawn(async move {
         let mut last_deployed_round = None;
         loop {
@@ -785,140 +791,54 @@ pub async fn update_data_system_all(connection: RpcClient, app_state: AppState) 
                         let (ev_slots, should_deploy) = evaluate_ev_only(&env, 0.2);
 
                         if (model.accuracy() >= 80.0) {
-                            match try_checkpoint_and_deploy(&connection, board.round_id, amount, &pred, "/Users/jeckhat/gawean/jeckhat/miners/poolminer1.json").await {
-                                Ok(DeployOutcome::Deployed(sig)) => {
-                                    // sukses -> tandai last_deployed_round
-                                    last_deployed_round = Some(board.round_id);
-                                    println!("Deployed for round {} sig {}", board.round_id, sig);
-                                }
-                                Ok(DeployOutcome::Skipped) => {
-                                    // kode sebelumnya banyak 'continue' diganti dengan ini
-                                    tracing::info!("Skipped deploy attempt for round {} - will retry next loop", board.round_id);
-                                    continue; // keep old behavior: lanjut loop utama
-                                }
-                                Err(e) => {
-                                    tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
-                                    continue;
-                                }
-                            }
-
-                            match try_checkpoint_and_deploy(&connection, board.round_id, amount, &pred, "/Users/jeckhat/gawean/jeckhat/miners/poolminer3.json").await {
-                                Ok(DeployOutcome::Deployed(sig)) => {
-                                    // sukses -> tandai last_deployed_round
-                                    last_deployed_round = Some(board.round_id);
-                                    println!("Deployed for round {} sig {}", board.round_id, sig);
-                                }
-                                Ok(DeployOutcome::Skipped) => {
-                                    // kode sebelumnya banyak 'continue' diganti dengan ini
-                                    println!("Skipped deploy attempt for round {} - will retry next loop", board.round_id);
-                                    continue; // keep old behavior: lanjut loop utama
-                                }
-                                Err(e) => {
-                                    println!("Unexpected error in checkpoint/deploy flow: {:?}", e);
-                                    continue;
-                                }
-                            }
-
-                            match try_checkpoint_and_deploy(&connection, board.round_id, amount, &pred, "/Users/jeckhat/gawean/jeckhat/miners/mebest.json").await {
-                                Ok(DeployOutcome::Deployed(sig)) => {
-                                    // sukses -> tandai last_deployed_round
-                                    last_deployed_round = Some(board.round_id);
-                                    println!("Deployed for round {} sig {}", board.round_id, sig);
-                                }
-                                Ok(DeployOutcome::Skipped) => {
-                                    // kode sebelumnya banyak 'continue' diganti dengan ini
-                                    tracing::info!("Skipped deploy attempt for round {} - will retry next loop", board.round_id);
-                                    continue; // keep old behavior: lanjut loop utama
-                                }
-                                Err(e) => {
-                                    tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
-                                    continue;
-                                }
-                            }
-
-                            match try_checkpoint_and_deploy(&connection, board.round_id, amount, &pred, "/Users/jeckhat/gawean/jeckhat/miners/meminer_1.json").await {
-                                Ok(DeployOutcome::Deployed(sig)) => {
-                                    // sukses -> tandai last_deployed_round
-                                    last_deployed_round = Some(board.round_id);
-                                    println!("Deployed for round {} sig {}", board.round_id, sig);
-                                }
-                                Ok(DeployOutcome::Skipped) => {
-                                    // kode sebelumnya banyak 'continue' diganti dengan ini
-                                    tracing::info!("Skipped deploy attempt for round {} - will retry next loop", board.round_id);
-                                    continue; // keep old behavior: lanjut loop utama
-                                }
-                                Err(e) => {
-                                    tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
-                                    continue;
+                            for path in &paths {
+                                match try_checkpoint_and_deploy(&connection, board.round_id, amount, &pred, path).await {
+                                    Ok(DeployOutcome::Deployed(sig)) => {
+                                        last_deployed_round = Some(board.round_id);
+                                        println!("Deployed for round {} sig {}", board.round_id, sig);
+                                    }
+                                    Ok(DeployOutcome::Skipped) => {
+                                        tracing::info!(
+                                            "Skipped deploy attempt for round {} (path {}) - will retry next loop",
+                                            board.round_id,
+                                            path
+                                        );
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Unexpected error in checkpoint/deploy flow (path {}): {:?}",
+                                            path,
+                                            e
+                                        );
+                                        continue;
+                                    }
                                 }
                             }
                         } else {
                             if (should_deploy) {
-                                match try_checkpoint_and_deploy(&connection, board.round_id, amount, &logic, "/Users/jeckhat/gawean/jeckhat/miners/poolminer1.json").await {
-                                    Ok(DeployOutcome::Deployed(sig)) => {
-                                        // sukses -> tandai last_deployed_round
-                                        last_deployed_round = Some(board.round_id);
-                                        println!("Deployed for round {} sig {}", board.round_id, sig);
-                                    }
-                                    Ok(DeployOutcome::Skipped) => {
-                                        // kode sebelumnya banyak 'continue' diganti dengan ini
-                                        tracing::info!("Skipped deploy attempt for round {} - will retry next loop", board.round_id);
-                                        continue; // keep old behavior: lanjut loop utama
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
-                                        continue;
-                                    }
-                                }
-            
-                                match try_checkpoint_and_deploy(&connection, board.round_id, amount, &logic, "/Users/jeckhat/gawean/jeckhat/miners/poolminer3.json").await {
-                                    Ok(DeployOutcome::Deployed(sig)) => {
-                                        // sukses -> tandai last_deployed_round
-                                        last_deployed_round = Some(board.round_id);
-                                        println!("Deployed for round {} sig {}", board.round_id, sig);
-                                    }
-                                    Ok(DeployOutcome::Skipped) => {
-                                        // kode sebelumnya banyak 'continue' diganti dengan ini
-                                        println!("Skipped deploy attempt for round {} - will retry next loop", board.round_id);
-                                        continue; // keep old behavior: lanjut loop utama
-                                    }
-                                    Err(e) => {
-                                        println!("Unexpected error in checkpoint/deploy flow: {:?}", e);
-                                        continue;
-                                    }
-                                }
-            
-                                match try_checkpoint_and_deploy(&connection, board.round_id, amount, &logic, "/Users/jeckhat/gawean/jeckhat/miners/mebest.json").await {
-                                    Ok(DeployOutcome::Deployed(sig)) => {
-                                        // sukses -> tandai last_deployed_round
-                                        last_deployed_round = Some(board.round_id);
-                                        println!("Deployed for round {} sig {}", board.round_id, sig);
-                                    }
-                                    Ok(DeployOutcome::Skipped) => {
-                                        // kode sebelumnya banyak 'continue' diganti dengan ini
-                                        tracing::info!("Skipped deploy attempt for round {} - will retry next loop", board.round_id);
-                                        continue; // keep old behavior: lanjut loop utama
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
-                                        continue;
-                                    }
-                                }
-            
-                                match try_checkpoint_and_deploy(&connection, board.round_id, amount, &logic, "/Users/jeckhat/gawean/jeckhat/miners/meminer_1.json").await {
-                                    Ok(DeployOutcome::Deployed(sig)) => {
-                                        // sukses -> tandai last_deployed_round
-                                        last_deployed_round = Some(board.round_id);
-                                        println!("Deployed for round {} sig {}", board.round_id, sig);
-                                    }
-                                    Ok(DeployOutcome::Skipped) => {
-                                        // kode sebelumnya banyak 'continue' diganti dengan ini
-                                        tracing::info!("Skipped deploy attempt for round {} - will retry next loop", board.round_id);
-                                        continue; // keep old behavior: lanjut loop utama
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
-                                        continue;
+                                for path in &paths {
+                                    match try_checkpoint_and_deploy(&connection, board.round_id, amount, &logic, path).await {
+                                        Ok(DeployOutcome::Deployed(sig)) => {
+                                            last_deployed_round = Some(board.round_id);
+                                            println!("Deployed for round {} sig {}", board.round_id, sig);
+                                        }
+                                        Ok(DeployOutcome::Skipped) => {
+                                            tracing::info!(
+                                                "Skipped deploy attempt for round {} (path {}) - will retry next loop",
+                                                board.round_id,
+                                                path
+                                            );
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Unexpected error in checkpoint/deploy flow (path {}): {:?}",
+                                                path,
+                                                e
+                                            );
+                                            continue;
+                                        }
                                     }
                                 }
                             }
@@ -1033,66 +953,22 @@ pub async fn update_data_system_all(connection: RpcClient, app_state: AppState) 
 
                     if win > 1 {
                         win = 0;
-                        match try_claim_sol(&connection, "/Users/jeckhat/gawean/jeckhat/miners/poolminer1.json").await {
-                            Ok(DeployOutcome::Deployed(sig)) => {
-                                tracing::info!("Claim submitted: {}", sig);
-                            }
-                            Ok(DeployOutcome::Skipped) => {
-                                // kode sebelumnya banyak 'continue' diganti dengan ini
-                                tracing::info!("Skipped claim attempt for round {} - will retry next loop", board.round_id);
-                                continue; // keep old behavior: lanjut loop utama
-                            }
-                            Err(e) => {
-                                tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
-                                continue;
-                            }
-                        }
-
-                        match try_claim_sol(&connection, "/Users/jeckhat/gawean/jeckhat/miners/poolminer3.json").await {
-                            Ok(DeployOutcome::Deployed(sig)) => {
-                                tracing::info!("Claim submitted: {}", sig);
-                            }
-                            Ok(DeployOutcome::Skipped) => {
-                                // kode sebelumnya banyak 'continue' diganti dengan ini
-                                tracing::info!("Skipped claim attempt for round {} - will retry next loop", board.round_id);
-                                continue; // keep old behavior: lanjut loop utama
-                            }
-                            Err(e) => {
-                                tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
-                                continue;
+                        for path in &paths {
+                            match try_claim_sol(&connection, path).await {
+                                Ok(DeployOutcome::Deployed(sig)) => {
+                                    tracing::info!("Claim submitted: {}", sig);
+                                }
+                                Ok(DeployOutcome::Skipped) => {
+                                    // kode sebelumnya banyak 'continue' diganti dengan ini
+                                    tracing::info!("Skipped claim attempt for round {} - will retry next loop", board.round_id);
+                                    continue; // keep old behavior: lanjut loop utama
+                                }
+                                Err(e) => {
+                                    tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
+                                    continue;
+                                }
                             }
                         }
-
-                        match try_claim_sol(&connection, "/Users/jeckhat/gawean/jeckhat/miners/mebest.json").await {
-                            Ok(DeployOutcome::Deployed(sig)) => {
-                                tracing::info!("Claim submitted: {}", sig);
-                            }
-                            Ok(DeployOutcome::Skipped) => {
-                                // kode sebelumnya banyak 'continue' diganti dengan ini
-                                tracing::info!("Skipped claim attempt for round {} - will retry next loop", board.round_id);
-                                continue; // keep old behavior: lanjut loop utama
-                            }
-                            Err(e) => {
-                                tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
-                                continue;
-                            }
-                        }
-
-                        match try_claim_sol(&connection, "/Users/jeckhat/gawean/jeckhat/miners/meminer_1.json").await {
-                            Ok(DeployOutcome::Deployed(sig)) => {
-                                tracing::info!("Claim submitted: {}", sig);
-                            }
-                            Ok(DeployOutcome::Skipped) => {
-                                // kode sebelumnya banyak 'continue' diganti dengan ini
-                                tracing::info!("Skipped claim attempt for round {} - will retry next loop", board.round_id);
-                                continue; // keep old behavior: lanjut loop utama
-                            }
-                            Err(e) => {
-                                tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
-                                continue;
-                            }
-                        }
-                        
                     }
                 
                     model.update(winning_square, &pred);
