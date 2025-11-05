@@ -280,7 +280,7 @@ pub async fn update_data_system_all(connection: RpcClient) {
                 pred.sort_unstable();
                 println!("Prediksi (0-based): {:?}", pred);
 
-                let amount = 10_000 * 10u64.pow(lose);
+                let amount = if lose > 0 { 10_000 * 10u64.pow(lose -1) } else { 10_000 };
 
                 // deploy/ev logic (preserve previous behavior but use pred)
                 match fetch_ore_env(&connection, BOARD_ADDRESS, ore_api::id()).await {
