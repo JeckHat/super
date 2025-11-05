@@ -64,8 +64,6 @@ pub async fn update_data_system(connection: RpcClient, app_state: AppState) {
 
                 negative_sol += amount * 4;
 
-                tokio::time::sleep(Duration::from_secs(20)).await;
-
                 match fetch_ore_env(&connection, BOARD_ADDRESS, ore_api::id()).await {
                     Ok(env) => {
                         (pred, pred2) = model.predict_two_alt();
@@ -292,7 +290,9 @@ pub async fn update_data_system(connection: RpcClient, app_state: AppState) {
                     println!("AI (EC)   : {:.2}%", ((total_win_pred2 as f64 / total as f64) * 100.0));
                     println!("number of round: {:}\n", "82");
 
-                    if win_1 > 1 {
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+
+                    if win_1 > 0 {
                         win_1 = 0;
                         match try_claim_sol(&connection, "/Users/jeckhat/gawean/jeckhat/miners/poolminer1.json").await {
                             Ok(DeployOutcome::Deployed(sig)) => {
@@ -741,7 +741,7 @@ pub async fn update_data_system_all(connection: RpcClient, app_state: AppState) 
     let mut total_win_pred = 0.0;
     let mut total_win_logic = 0.0;
     // let mut pred = model.predict_hybrid();
-    let mut pred = model.predict_hybrid();
+    let mut pred = model.predict();
     let logic = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24];
     let mut win = 0;
     let mut lose = 0;
@@ -774,7 +774,7 @@ pub async fn update_data_system_all(connection: RpcClient, app_state: AppState) 
             if last_deployed_round != Some(board.round_id) {
                 last_deployed_round = Some(board.round_id);
                 println!("round {}", board.round_id);
-                pred = model.predict_hybrid();
+                pred = model.predict();
                 total += 1;
                 println!("Prediksi : {:?}", pred);
 
@@ -784,11 +784,9 @@ pub async fn update_data_system_all(connection: RpcClient, app_state: AppState) 
                     10_000
                 };
 
-                tokio::time::sleep(Duration::from_secs(20)).await;
-
                 match fetch_ore_env(&connection, BOARD_ADDRESS, ore_api::id()).await {
                     Ok(env) => {
-                        let (ev_slots, should_deploy) = evaluate_ev_only(&env, 0.2);
+                        let (ev_slots, should_deploy) = evaluate_ev_only(&env, 0.0);
 
                         if (model.accuracy() >= 80.0) {
                             for path in &paths {
@@ -951,7 +949,9 @@ pub async fn update_data_system_all(connection: RpcClient, app_state: AppState) 
                     println!("WR AI  : {:.2}%", ((total_win_pred as f64 / total as f64) * 100.0));
                     println!("WR ME  : {:.2}%", ((total_win_logic as f64 / total as f64) * 100.0));
 
-                    if win > 1 {
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+
+                    if win > 0 {
                         win = 0;
                         for path in &paths {
                             match try_claim_sol(&connection, path).await {
@@ -1154,12 +1154,12 @@ pub async fn update_data_system_all(connection: RpcClient, app_state: AppState) 
 // }
 // }
 
-enum DeployOutcome {
+pub enum DeployOutcome {
     Deployed(Signature), // sukses, kembalikan signature
     Skipped,             // tidak jadi deploy -> lanjut loop utama (sama efek dengan `continue`)
 }
 
-async fn try_checkpoint_and_deploy(
+pub async fn try_checkpoint_and_deploy(
     connection: &RpcClient,
     board_round: u64,
     amount: u64,
@@ -1283,7 +1283,7 @@ async fn try_checkpoint_and_deploy(
     }
 }
 
-async fn try_claim_sol(
+pub async fn try_claim_sol(
     connection: &RpcClient,
     keyfile_path: &str
 ) -> Result<DeployOutcome> {
@@ -1399,7 +1399,6 @@ async fn try_claim_sol(
     }
 }
 
-
 pub fn infer_refined_ore(miner: &Miner, treasury: &Treasury) -> u64 {
     let delta = treasury.miner_rewards_factor - miner.rewards_factor;
     if delta < Numeric::ZERO {
@@ -1429,6 +1428,8 @@ pub fn evaluate_ev_only(env: &OreEnv, ev_threshold: f64) -> (Vec<(usize, f64)>, 
     for i in 0..25 {
         let result = compute_ev_star_for_block(env.os[i], env.total_t, env.ore_value_in_sol);
         let ev = result.ev;
+
+        println!("Block {}: {}", i, ev);
 
         if ev > ev_threshold {
             ev_list.push((i, ev));

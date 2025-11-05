@@ -1,11 +1,11 @@
-use std::{env, str::FromStr, sync::Arc, time::{Duration, Instant}};
+use std::{env, fs::{File, OpenOptions}, io::{BufReader, Read}, str::FromStr, sync::Arc, time::{Duration, Instant}};
 
-use anyhow::{anyhow, bail};
+use anyhow::{Context, anyhow, bail};
 use sqlx::sqlite::SqliteConnectOptions;
 use thiserror::Error;
 use axum::{body::Body, extract::{Path, Query, State}, http::{Request, Response, StatusCode}, middleware::{self, Next}, routing::get, Json, Router};
 use const_crypto::ed25519;
-use ore_api::{consts::{BOARD, ROUND, TREASURY_ADDRESS}, state::{round_pda, Board, Miner, Round, Treasury}};
+use ore_api::{consts::{BOARD, ROUND, SPLIT_ADDRESS, TREASURY_ADDRESS}, state::{Board, Miner, Round, Treasury, round_pda}};
 use serde::{Deserialize, Serialize};
 use solana_account_decoder_client_types::UiAccountEncoding;
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_filter::RpcFilterType};
@@ -13,20 +13,8 @@ use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
 use steel::{AccountDeserialize, Pubkey};
 use tokio::{signal, sync::{Mutex, RwLock}};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-
-use crate::{app_state::{AppBoard, AppMiner, AppRound, AppState, AppTreasury}, database::{CreateDeployment, DbMinerSnapshot, DbTreasury, MinerLeaderboardRow, MinerOreLeaderboardRow, MinerTotalsRow, RoundRow, get_deployments_by_round}, rpc::{infer_refined_ore, update_data_system, update_data_system_all}};
-
-/// Program id for const pda derivations
-const PROGRAM_ID: [u8; 32] = unsafe { *(&ore_api::id() as *const Pubkey as *const [u8; 32]) };
-
-
-/// The address of the board account.
-pub const BOARD_ADDRESS: Pubkey =
-    Pubkey::new_from_array(ed25519::derive_program_address(&[BOARD], &PROGRAM_ID).0);
-
-/// The address of the square account.
-pub const ROUND_ADDRESS: Pubkey =
-    Pubkey::new_from_array(ed25519::derive_program_address(&[ROUND], &PROGRAM_ID).0);
+use std::io::Write;
+use std::path::Path as FsPath;
 
 pub mod app_state;
 pub mod rpc;
@@ -35,6 +23,14 @@ pub mod ai;
 pub mod slot_miner;
 pub mod ore_env;
 pub mod ev;
+pub mod markov_chain;
+
+use crate::{app_state::{AppBoard, AppMiner, AppRound, AppState, AppTreasury}, database::{CreateDeployment, DbMinerSnapshot, DbTreasury, MinerLeaderboardRow, MinerOreLeaderboardRow, MinerTotalsRow, RoundRow, get_deployments_by_round}, ore_env::fetch_ore_env, rpc::{DeployOutcome, evaluate_ev_only, infer_refined_ore, try_checkpoint_and_deploy, try_claim_sol}};
+
+const PROGRAM_ID: [u8; 32] = unsafe { *(&ore_api::id() as *const Pubkey as *const [u8; 32]) };
+
+pub const BOARD_ADDRESS: Pubkey =
+    Pubkey::new_from_array(ed25519::derive_program_address(&[BOARD], &PROGRAM_ID).0);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -46,42 +42,7 @@ async fn main() -> anyhow::Result<()> {
         .with(env_filter)
         .init();
 
-    let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://data/app.db".to_string());
-    if let Some(path) = db_url.strip_prefix("sqlite://") {
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-    }
-
-    let db_connect_ops = SqliteConnectOptions::from_str(&db_url)?
-        .create_if_missing(true)
-        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-        .pragma("cache_size", "-200000") // Set cache to ~200MB (200,000KB)
-        .pragma("temp_store", "memory") // Store temporary data in memory
-        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
-        .busy_timeout(Duration::from_secs(15))
-        .foreign_keys(true);
-
-    let db_pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .min_connections(2)
-        .max_connections(10)
-        .acquire_timeout(Duration::from_secs(10))
-        .connect_with(db_connect_ops)
-        .await?;
-
-
-    tracing::info!("Running optimize...");
-    sqlx::query("PRAGMA optimize").execute(&db_pool).await?;
-    tracing::info!("Optimize complete!");
-
-
-
     tracing::info!("Running migrations...");
-
-    sqlx::migrate!("./migrations").run(&db_pool).await?;
-
-    tracing::info!("Database migrations complete.");
-    tracing::info!("Database ready!");
 
     let rpc_url = env::var("RPC_URL").expect("RPC_URL must be set");
     let prefix = "https://".to_string();
@@ -111,452 +72,383 @@ async fn main() -> anyhow::Result<()> {
     };
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let mut miners = vec![];
-    if let Ok(miners_data_raw) = connection.get_program_accounts_with_config(
-        &ore_api::id(),
-        solana_client::rpc_config::RpcProgramAccountsConfig { 
-            filters: Some(vec![RpcFilterType::DataSize(size_of::<Miner>() as u64 + 8)]),
-            account_config: solana_client::rpc_config::RpcAccountInfoConfig {
-                encoding: Some(UiAccountEncoding::Base64),
-                data_slice: None,
-                commitment: Some(CommitmentConfig { commitment: CommitmentLevel::Confirmed }),
-                min_context_slot: None,
-            },
-            with_context: None,
-            sort_results: None
-        } 
-    ).await {
-        for miner_data in miners_data_raw {
-            if let Ok(miner) = Miner::try_from_bytes(&miner_data.1.data) {
-                let mut miner = miner.clone();
-                miner.refined_ore = infer_refined_ore(&miner, &treasury);
-                miners.push(miner.clone().into());
-            }
-        }
+    let out_path = "output.txt";
+    let need_header = !FsPath::new(out_path).exists();
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out_path)
+        .context("error path")?;
+
+    if need_header {
+        writeln!(file, "round,angka_valid")?;
     }
 
-    let app_state = AppState {
-        treasury: Arc::new(RwLock::new(treasury.into())),
-        board: Arc::new(RwLock::new(board.into())),
-        staring_round: board.round_id,
-        rounds: Arc::new(RwLock::new(vec![])),
-        miners: Arc::new(RwLock::new(miners)),
-        db_pool,
-    };
+    let board_data = connection.get_account_data(&BOARD_ADDRESS).await?;
+    let board = Board::try_from_bytes(&board_data)?;
+    let start_round = &board.round_id - 300;
+    for i in start_round..=board.round_id {
+        let round_key = &round_pda(i).0;
+        match connection.get_account_data(&round_key).await {
+            Ok(data) => {
+                match Round::try_from_bytes(&data) {
+                    Ok(round) => {
+                        if let Some(rng) = round.rng() {
+                            // winning square (0..24)
+                            let winning_square = round.winning_square(rng) as usize;
+        
+                            // writeln!(file, "{},{}", timestamp_str, id)?;
+                            println!("Round: {} \nTotal_deployed: {}\nTime: {}\nSquare: {}\n\n",
+                                i, round.total_deployed, round.expires_at, winning_square
+                            );
+                            writeln!(file, "{},{}", i, winning_square)?;
+                        }
+                    },
+                    Err(e) => {
 
-    let s = app_state.clone();
-    update_data_system_all(connection, s).await;
+                    }
+                }
+                // let data = account.data;
+                // Anchor accounts usually have 8-byte discriminator at start
+                // let offset = 8usize;
+                // let expected_size = size_of::<Round>();
+                // if data.len() < offset + expected_size {
+                //     eprintln!("Account {} data too small for Round (id {})", pda, id);
+                //     continue;
+                // }
 
-    let state = app_state.clone();
+                // let slice = &data[offset..offset + expected_size];
+                // Safety: Round is marked Pod and Zeroable; ensure on-chain layout exactly matches.
+                // let round: &Round = Round::try_from_bytes(&data);
 
-    let app = Router::new()
-        .route("/", get(root))
-        .route("/treasury", get(get_treasury))
-        .route("/board", get(get_board))
-        .route("/round", get(get_round))
-        .route("/miners", get(get_miners))
-        .route("/deployments", get(get_deployments))
-        .route("/rounds", get(get_rounds))
-        .route("/treasuries", get(get_treasuries))
-        .route("/search/pubkey/{letters}", get(get_available_pubkeys))
-        .route("/miner/latest/{pubkey}", get(get_miner_latest))
-        .route("/miner/snapshot/{pubkey}", get(get_miner_snapshot))
-        .route("/miner/{pubkey}", get(get_miner_history))
-        .route("/miner/rounds/{pubkey}", get(get_miner_rounds))
-        .route("/miner/stats/{pubkey}", get(get_miner_stats))
-        .route("/miner/totals", get(get_miner_totals))
-        .route("/miner/totals/ore", get(get_miner_totals_ore))
-        .route("/leaderboard", get(get_leaderboard))
-        .route("/leaderboard/ore", get(get_leaderboard_ore))
-        .route("/leaderboard/latest-rounds", get(get_leaderboard_latest_rounds))
-        .route("/leaderboard/latest-rounds/ore", get(get_leaderboard_latest_rounds_ore))
-        .route("/leaderboard/all-time", get(get_leaderboard_all_time))
-        .route("/leaderboard/all-time/ore", get(get_leaderboard_all_time_ore))
-        .layer(middleware::from_fn(log_request_time))
-        .with_state(state);
+                // Ambil waktu dari expires_at (diasumsikan unix timestamp detik)
+                // let ts = round.expires_at;
+                // let dt = NaiveDateTime::from_timestamp_opt(ts as i64, 0)
+                //     .map(|n| DateTime::<Utc>::from_utc(n, Utc))
+                //     .unwrap_or_else(|| Utc::now()); // fallback kalau nilai tidak valid
+
+                // let timestamp_str = dt.format("%Y-%m-%d %H:%M:%S").to_string();
+
+                
+            }
+            Err(err) => {
+                eprintln!("Failed getting account for id {}: {}", i, err);
+                // lanjut ke id berikutnya
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    
+
+    update_data_system_all(connection).await;
+
+    // let state = app_state.clone();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080")
         .await?;
 
     tracing::debug!("Listening on {}", listener.local_addr()?);
 
-    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
-
     Ok(())
 }
 
+pub async fn update_data_system_all(connection: RpcClient) {
+    tracing::info!("Starting update_data_system (Markov-2)");
 
-async fn log_request_time(
-    req: Request<Body>,
-    next: Next,
-) -> Result<Response<Body>, StatusCode> {
-    let start_time = Instant::now();
-    let method = req.method().to_string();
-    let uri = req.uri().to_string();
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
 
-    let headers = req.headers();
+    // bring Markov2 into scope
+    use crate::markov_chain::Markov2;
 
-    let forwarded_for = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
+    fn load_history(path: &str) -> Vec<usize> {
+        let f = File::open(path);
+        if f.is_err() { return vec![]; }
+        let mut content = String::new();
+        if let Err(_) = std::fs::read_to_string(path).and_then(|s| { content = s; Ok(()) }) { return vec![]; }
 
-    let response = next.run(req).await;
+        // detect one-based
+        let mut one_based = false;
+        for (i, line) in content.lines().enumerate() {
+            let l = line.trim();
+            if l.is_empty() { continue; }
+            if i == 0 && l.to_lowercase().contains("round") && l.to_lowercase().contains("angka") { continue; }
+            let parts: Vec<&str> = l.split(',').collect();
+            let tok = if parts.len() >= 2 { parts[1].trim() } else { parts[0].trim() };
+            if let Ok(v) = tok.parse::<i64>() {
+                if v > 24 { one_based = true; break; }
+            }
+        }
 
-    let duration = start_time.elapsed();
-    tracing::info!(
-        "Client IP: {} - Request: {} {} - - Duration: {:?}",
-        forwarded_for,
-        method,
-        uri,
-        duration
-    );
-
-    Ok(response)
-}
-
-async fn root() -> &'static str {
-    "ORE"
-}
-
-#[derive(Debug, Deserialize)]
-struct MinersPagination {
-    limit: Option<i64>,
-    offset: Option<i64>,
-    order_by: Option<String>,
-}
-
-async fn get_miners(
-    State(state): State<AppState>,
-    Query(p): Query<MinersPagination>,
-) -> Result<Json<Vec<AppMiner>>, AppError> {
-    let limit = p.limit.unwrap_or(2500).max(1).min(2500) as usize;
-    let offset = p.offset.unwrap_or(0).max(0) as usize;
-    let miners = state.miners.clone();
-    let reader = miners.read().await;
-    let mut miners = reader.clone();
-    drop(reader);
-    if miners.len() > 0 {
-        match p.order_by {
-            Some(v) => {
-                if v.eq("unclaimed_sol") {
-                    miners.sort_by(|a, b| b.rewards_sol.partial_cmp(&a.rewards_sol).unwrap());
-                } else if v.eq("unclaimed_ore") {
-                    miners.sort_by(|a, b| b.rewards_ore.partial_cmp(&a.rewards_ore).unwrap());
-                } else if v.eq("refined_ore") {
-                    miners.sort_by(|a, b| b.refined_ore.partial_cmp(&a.refined_ore).unwrap());
-                } else if v.eq("total_deployed") {
-                    miners.sort_by(|a, b| b.total_deployed.partial_cmp(&a.total_deployed).unwrap());
-                } else if v.eq("round_id") {
-                    miners.sort_by(|a, b| b.round_id.partial_cmp(&a.round_id).unwrap());
+        let mut out = Vec::new();
+        for (i, line) in content.lines().enumerate() {
+            let l = line.trim();
+            if l.is_empty() { continue; }
+            if i == 0 && l.to_lowercase().contains("round") && l.to_lowercase().contains("angka") { continue; }
+            let parts: Vec<&str> = l.split(',').collect();
+            let tok = if parts.len() >= 2 { parts[1].trim() } else { parts[0].trim() };
+            if let Ok(v) = tok.parse::<i64>() {
+                if one_based {
+                    if (1..=25).contains(&v) { out.push((v - 1) as usize); }
+                } else {
+                    if (0..=24).contains(&v) { out.push(v as usize); }
                 }
-            },
-            None => {
-                // No ordering
             }
         }
-        let start = offset.min(miners.len() - 2);
-        let end = start + limit.min(miners.len() - 1 - start);
-        return Ok(Json(miners[start..end].to_vec()));
+        out
     }
-    Ok(Json(miners))
-}
 
-async fn get_treasury(
-    State(state): State<AppState>,
-) -> Result<Json<AppTreasury>, AppError> {
-    let r = state.treasury.clone();
-    let lock = r.read().await;
-    let data = lock.clone();
-    Ok(Json(data))
-}
-
-
-async fn get_board(
-    State(state): State<AppState>,
-) -> Result<Json<AppBoard>, AppError> {
-    let r = state.board.clone();
-    let lock = r.read().await;
-    let data = lock.clone();
-    Ok(Json(data))
-}
-
-async fn get_round(
-    State(state): State<AppState>,
-) -> Result<Json<AppRound>, AppError> {
-    let r = state.rounds.clone();
-    let lock = r.read().await;
-    let data = lock.clone();
-    drop(lock);
-    if let Some(d) = data.last() {
-        Ok(Json(d.clone()))
-    } else {
-        Err(anyhow!("Failed to get last round").into())
+    // load last N rounds
+    let mut history = load_history("output.txt");
+    let last_n = 300usize;
+    if history.len() > last_n {
+        history = history.split_off(history.len() - last_n);
     }
-}
 
-#[derive(Debug, Deserialize)]
-struct RoundsPagination {
-    limit: Option<i64>,
-    offset: Option<i64>,
-    ml: Option<bool>
-}
-
-async fn get_rounds(
-    State(state): State<AppState>,
-    Query(p): Query<RoundsPagination>,
-) -> Result<Json<Vec<RoundRow>>, AppError> {
-    let limit = p.limit.unwrap_or(100).max(1).min(2000);
-    let offset = p.offset.unwrap_or(0).max(0);
-    let rounds = database::get_rounds(&state.db_pool, limit, offset, p.ml).await?;
-    Ok(Json(rounds))
-}
-
-async fn get_treasuries(
-    State(state): State<AppState>,
-    Query(p): Query<RoundsPagination>,
-) -> Result<Json<Vec<DbTreasury>>, AppError> {
-    let limit = p.limit.unwrap_or(2000).max(1).min(2000);
-    let offset = p.offset.unwrap_or(0).max(0);
-    let treasuries = database::get_treasuries(&state.db_pool, limit, offset).await?;
-    Ok(Json(treasuries))
-}
-
-async fn get_miner_history(
-    State(state): State<AppState>,
-    Path(pubkey): Path<String>,
-    Query(p): Query<RoundsPagination>,
-) -> Result<Json<Vec<DbMinerSnapshot>>, AppError> {
-    let limit = p.limit.unwrap_or(1200).max(1).min(2000);
-    let offset = p.offset.unwrap_or(0).max(0);
-    let miners_history = database::get_miner_snapshots(&state.db_pool, pubkey, limit, offset).await?;
-    Ok(Json(miners_history))
-}
-
-async fn get_miner_rounds(
-    State(state): State<AppState>,
-    Path(pubkey): Path<String>,
-    Query(p): Query<RoundsPagination>,
-) -> Result<Json<Vec<RoundRow>>, AppError> {
-    let limit = p.limit.unwrap_or(10).max(1).min(100);
-    let offset = p.offset.unwrap_or(0).max(0);
-    let rounds = database::get_miner_rounds(&state.db_pool, pubkey, limit, offset).await?;
-    Ok(Json(rounds))
-}
-
-#[derive(Debug, Deserialize)]
-struct RoundId {
-    round_id: u64,
-}
-
-async fn get_deployments(
-    State(state): State<AppState>,
-    Query(p): Query<RoundId>,
-) -> Result<Json<Vec<CreateDeployment>>, AppError> {
-    let deployments = get_deployments_by_round(&state.db_pool, p.round_id as i64).await?;
-    Ok(Json(deployments))
-}
-
-#[derive(Debug, Deserialize)]
-struct Pagination {
-    limit: Option<i64>,
-    offset: Option<i64>,
-}
-
-async fn get_miner_totals(
-    State(state): State<AppState>,
-    Query(p): Query<Pagination>,
-) -> Result<Json<Vec<MinerTotalsRow>>, AppError> {
-    let limit = p.limit.unwrap_or(100).clamp(1, 2000);
-    let offset = p.offset.unwrap_or(0).max(0);
-    let rows = database::get_miner_totals_all_time(&state.db_pool, limit, offset).await?;
-    Ok(Json(rows))
-}
-
-async fn get_leaderboard_all_time(
-    State(state): State<AppState>,
-    Query(p): Query<Pagination>,
-) -> Result<Json<Vec<MinerTotalsRow>>, AppError> {
-    let limit = p.limit.unwrap_or(100).clamp(1, 2000);
-    let offset = p.offset.unwrap_or(0).max(0);
-    let rows = database::get_miner_totals_all_time_v2(&state.db_pool, limit, offset).await?;
-    Ok(Json(rows))
-}
-
-async fn get_leaderboard(
-    State(state): State<AppState>,
-    Query(p): Query<Pagination>,
-) -> Result<Json<Vec<MinerLeaderboardRow>>, AppError> {
-    let limit = p.limit.unwrap_or(100).clamp(1, 2000);
-    let offset = p.offset.unwrap_or(0).max(0);
-    let rounds = 60;
-    let rows = database::get_leaderboard_last_n_rounds(&state.db_pool, rounds, limit, offset).await?;
-    Ok(Json(rows))
-}
-
-async fn get_leaderboard_latest_rounds(
-    State(state): State<AppState>,
-    Query(p): Query<Pagination>,
-) -> Result<Json<Vec<MinerLeaderboardRow>>, AppError> {
-    let limit = p.limit.unwrap_or(100).clamp(1, 2000);
-    let offset = p.offset.unwrap_or(0).max(0);
-    let rounds = 60;
-    let rows = database::get_leaderboard_last_n_rounds_v2(&state.db_pool, rounds, limit, offset).await?;
-    Ok(Json(rows))
-}
-
-#[derive(Debug, Deserialize)]
-struct OreLeaderboardQuery {
-    limit: Option<i64>,
-    offset: Option<i64>,
-    //rounds: Option<i64>, // if present, use "Last X rounds"; else All Time
-}
-
-async fn get_miner_totals_ore(
-    State(state): State<AppState>,
-    Query(q): Query<OreLeaderboardQuery>,
-) -> Result<Json<Vec<MinerOreLeaderboardRow>>, AppError> {
-    let limit  = q.limit.unwrap_or(100).clamp(1, 2000);
-    let offset = q.offset.unwrap_or(0).max(0);
-    let rows =  database::get_ore_leaderboard_all_time(&state.db_pool, limit, offset).await?;
-    Ok(Json(rows))
-}
-
-async fn get_leaderboard_all_time_ore(
-    State(state): State<AppState>,
-    Query(q): Query<OreLeaderboardQuery>,
-) -> Result<Json<Vec<MinerOreLeaderboardRow>>, AppError> {
-    let limit  = q.limit.unwrap_or(100).clamp(1, 2000);
-    let offset = q.offset.unwrap_or(0).max(0);
-    let rows =  database::get_ore_leaderboard_all_time_v2(&state.db_pool, limit, offset).await?;
-    Ok(Json(rows))
-}
-
-async fn get_leaderboard_ore(
-    State(state): State<AppState>,
-    Query(p): Query<Pagination>,
-) -> Result<Json<Vec<MinerOreLeaderboardRow>>, AppError> {
-    let limit = p.limit.unwrap_or(100).clamp(1, 2000);
-    let offset = p.offset.unwrap_or(0).max(0);
-    let rows = database::get_ore_leaderboard_last_n_rounds(&state.db_pool, 60, limit, offset).await?;
-    Ok(Json(rows))
-}
-
-async fn get_leaderboard_latest_rounds_ore(
-    State(state): State<AppState>,
-    Query(p): Query<Pagination>,
-) -> Result<Json<Vec<MinerOreLeaderboardRow>>, AppError> {
-    let limit = p.limit.unwrap_or(100).clamp(1, 2000);
-    let offset = p.offset.unwrap_or(0).max(0);
-    let rows = database::get_ore_leaderboard_last_n_rounds_v2(&state.db_pool, 60, limit, offset).await?;
-    Ok(Json(rows))
-}
-
-async fn get_miner_stats(
-    State(state): State<AppState>,
-    Path(pubkey): Path<String>,
-    Query(p): Query<RoundsPagination>,
-) -> Result<Json<Vec<MinerTotalsRow>>, AppError> {
-    let miner_stats = database::get_miner_stats(&state.db_pool, pubkey).await?;
-    if let Some(s) = miner_stats {
-        return Ok(Json(vec![s]))
+    // build Markov2 and train
+    let mut mc = Markov2::new(1.0);
+    if !history.is_empty() {
+        mc.train(&history);
+        tracing::info!("Markov2 trained on {} entries", history.len());
     } else {
-        return Ok(Json(vec![]))
+        tracing::warn!("No history found; Markov2 untrained (will use marginal fallback)");
     }
-}
 
-async fn get_miner_latest(
-    State(state): State<AppState>,
-    Path(pubkey): Path<String>,
-) -> Result<Json<Option<AppMiner>>, AppError> {
-    let pubkey = if let Ok(p) = Pubkey::from_str(&pubkey) {
-        p.to_string()
-    } else {
-        return Ok(Json(None))
-    };
+    // bookkeeping similar to original
+    let mut total = 0usize;
+    let mut total_win_pred = 0.0;
+    let mut total_win_logic = 0.0;
+    let mut pred: Vec<usize> = vec![];
+    let logic = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24];
+    let mut win = 0i32;
+    let mut lose = 0u32;
+    let paths = [
+        "/Users/jeckhat/gawean/jeckhat/miners/poolminer1.json",
+        "/Users/jeckhat/gawean/jeckhat/miners/poolminer3.json",
+        "/Users/jeckhat/gawean/jeckhat/miners/mebest.json",
+        "/Users/jeckhat/gawean/jeckhat/miners/meminer_1.json",
+    ];
 
-    let miners = state.miners.clone();
-    let reader = miners.read().await;
-    let miners = reader.clone();
-    drop(reader);
-    if miners.len() > 0 {
-        for m in miners {
-            if m.authority == pubkey {
-                return Ok(Json(Some(m)));
+    // last two observed values for conditioning
+    let mut last1: Option<usize> = history.last().copied();
+    let mut last2: Option<usize> = if history.len() >= 2 { Some(history[history.len()-2]) } else { None };
+
+    // tokio::spawn(async move {
+        let mut last_deployed_round = None;
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            // fetch board
+            let board = if let Ok(data) = connection.get_account_data(&BOARD_ADDRESS).await {
+                if let Ok(b) = Board::try_from_bytes(&data) {
+                    b.clone()
+                } else {
+                    tracing::error!("Failed to parse Board account");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            } else {
+                tracing::error!("Failed to load board account data");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            };
+
+            if last_deployed_round != Some(board.round_id) {
+                last_deployed_round = Some(board.round_id);
+                println!("round {}", board.round_id);
+                total += 1;
+
+                // produce prediction using Markov-2 if we have two previous observations
+                pred.clear();
+                if let (Some(a), Some(b)) = (last2, last1) {
+                    pred = mc.predict(a, b, 18, 1.0); // temperature 1.0 default
+                    if pred.len() < 18 {
+                        // fill from marginal if needed
+                        let mut fill = mc.marginal_topk(18);
+                        fill.retain(|x| !pred.contains(x));
+                        pred.extend(fill.into_iter().take(18 - pred.len()));
+                    }
+                } else if let Some(b) = last1 {
+                    // if only one previous, fallback to marginal weighted but prefer neighbors
+                    pred = mc.marginal_topk(18);
+                } else {
+                    // cold-start uniform top-18 (0..17) — but better use marginal if present
+                    pred = (0..25usize).take(18).collect();
+                }
+
+                pred.sort_unstable();
+                println!("Prediksi (0-based): {:?}", pred);
+
+                let amount = 10_000 * 10u64.pow(lose);
+
+                // deploy/ev logic (preserve previous behavior but use pred)
+                match fetch_ore_env(&connection, BOARD_ADDRESS, ore_api::id()).await {
+                    Ok(env) => {
+                        let (ev_slots, should_deploy) = evaluate_ev_only(&env, 0.0);
+
+                        // simple rule: if we have any training then use pred, else use should_deploy+logic
+                        let trained = !mc.counts.is_empty();
+                        if trained {
+                            for path in &paths {
+                                match try_checkpoint_and_deploy(&connection, board.round_id, amount, &pred, path).await {
+                                    Ok(DeployOutcome::Deployed(sig)) => {
+                                        last_deployed_round = Some(board.round_id);
+                                        println!("Deployed for round {} sig {}", board.round_id, sig);
+                                    }
+                                    Ok(DeployOutcome::Skipped) => {
+                                        tracing::info!("Skipped deploy attempt for round {} (path {}) - will retry next loop", board.round_id, path);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Unexpected error in checkpoint/deploy flow (path {}): {:?}", path, e);
+                                        continue;
+                                    }
+                                }
+                            }
+                        } else {
+                            if should_deploy {
+                                for path in &paths {
+                                    match try_checkpoint_and_deploy(&connection, board.round_id, 10_000, &logic, path).await {
+                                        Ok(DeployOutcome::Deployed(sig)) => {
+                                            last_deployed_round = Some(board.round_id);
+                                            println!("Deployed for round {} sig {}", board.round_id, sig);
+                                        }
+                                        Ok(DeployOutcome::Skipped) => {
+                                            tracing::info!("Skipped deploy attempt for round {} (path {}) - will retry next loop", board.round_id, path);
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Unexpected error in checkpoint/deploy flow (path {}): {:?}", path, e);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => println!("❌ Gagal ambil data: {:?}", e),
+                }
+            }
+
+            // wait for RNG result (same logic as before)
+            let last_deployable_slot = board.end_slot;
+            let current_slot = if let Ok(s) = connection.get_slot().await { s } else {
+                tracing::error!("Failed to get slot from rpc");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            };
+            let slots_left_in_round = last_deployable_slot as i64 - current_slot as i64;
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            let round_key = &round_pda(board.round_id).0;
+            let start_wait = Instant::now();
+
+            if slots_left_in_round < 0 {
+                let round: Round = loop {
+                    match connection.get_account_data(&round_key).await {
+                        Ok(data) if !data.is_empty() => match Round::try_from_bytes(&data) {
+                            Ok(r_ref) => {
+                                let round_owned = r_ref.clone();
+                                if let Some(rng) = round_owned.rng() {
+                                    tracing::info!("✅ Round {} RNG available after {}s (rng={})", board.round_id, start_wait.elapsed().as_secs(), rng);
+                                    break round_owned;
+                                } else {
+                                    tracing::info!("⌛ Round {} still missing slot_hash... waiting 5s", board.round_id);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("⚠️ Failed to parse Round {}: {:?}, retrying in 5s...", board.round_id, e);
+                            }
+                        },
+                        Ok(_) => {
+                            tracing::info!("ℹ️ Round account {} empty, waiting 5s...", board.round_id);
+                        }
+                        Err(e) => {
+                            tracing::warn!("⚠️ RPC error fetching round {}: {:?}, retrying in 5s...", board.round_id, e);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                };
+
+                if let Some(rng) = round.rng() {
+                    let winning_square = round.winning_square(rng) as usize;
+                    tracing::info!("Round {} RNG present. rng={} winning_square={}", round.id, rng, winning_square);
+
+                    // scoring
+                    let hit_pred = pred.contains(&winning_square);
+                    let hit_logic = logic.contains(&winning_square);
+                    println!("Prediksi  : {:?}", pred);
+                    println!("Win Block : {}", winning_square);
+                    println!("Hasil AI  : {}", if hit_pred { "✅ BENAR" } else { "❌ SALAH" });
+                    println!("Hasil ME  : {}", if hit_logic { "✅ BENAR" } else { "❌ SALAH" });
+
+                    if hit_pred {
+                        total_win_pred += 1.0;
+                        win += 1;
+                        if lose > 0 { lose = 0; }
+                    } else {
+                        lose += 1;
+                        win = 0;
+                    }
+                    if hit_logic {
+                        total_win_logic += 1.0;
+                    }
+
+                    println!("WR AI  : {:.2}%", ((total_win_pred as f64 / total as f64) * 100.0));
+                    println!("WR ME  : {:.2}%", ((total_win_logic as f64 / total as f64) * 100.0));
+
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+
+                    if win > 0 {
+                        win = 0;
+                        for path in &paths {
+                            match try_claim_sol(&connection, path).await {
+                                Ok(DeployOutcome::Deployed(sig)) => {
+                                    tracing::info!("Claim submitted: {}", sig);
+                                }
+                                Ok(DeployOutcome::Skipped) => {
+                                    tracing::info!("Skipped claim attempt for round {} - will retry next loop", board.round_id);
+                                    continue;
+                                }
+                                Err(e) => {
+                                    tracing::error!("Unexpected error in checkpoint/deploy flow: {:?}", e);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    // Update Markov with the observed transition
+                    if let (Some(p2), Some(p1)) = (last2, last1) {
+                        mc.update(p2, p1, winning_square);
+                    }
+                    // shift history
+                    last2 = last1;
+                    last1 = Some(winning_square);
+
+                    println!("(Markov2) updated transition, now contexts: {}", mc.counts.len());
+
+                    // denom etc same as before
+                    let denom = round.deployed[winning_square];
+                    if denom == 0 {
+                        (Some(winning_square), None, Some(denom))
+                    } else {
+                        let top_sample = if round.top_miner == SPLIT_ADDRESS {
+                            None
+                        } else {
+                            Some(round.top_miner_sample(rng, winning_square))
+                        };
+                        (Some(winning_square), top_sample, Some(denom))
+                    }
+                } else {
+                    tracing::error!("Failed to get round rng for round {}", round.id);
+                    (None, None, None)
+                };
+            } else {
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
-    }
-    Ok(Json(None))
-}
-
-async fn get_miner_snapshot(
-    State(state): State<AppState>,
-    Path(pubkey): Path<String>,
-) -> Result<Json<Option<DbMinerSnapshot>>, AppError> {
-    if let Ok(p) = Pubkey::from_str(&pubkey) {
-        let earnings = database::get_snapshot_24h_ago(&state.db_pool, p.to_string()).await?;
-        return Ok(Json(earnings))
-    } else {
-        return Ok(Json(None))
-    };
-}
-
-async fn get_available_pubkeys(
-    State(state): State<AppState>,
-    Path(letters): Path<String>,
-) -> Result<Json<Vec<String>>, AppError> {
-    let pubkeys = database::get_available_pubkeys(&state.db_pool, letters).await?;
-    return Ok(Json(pubkeys))
-}
-
-#[derive(Error, Debug)]
-enum AppError {
-    #[error("not found")]
-    NotFound,
-    #[error(transparent)]
-    Sqlx(#[from] sqlx::Error),
-    #[error(transparent)]
-    Anyhow(#[from] anyhow::Error),
-}
-
-impl axum::response::IntoResponse for AppError {
-    fn into_response(self) -> axum::response::Response {
-        use axum::{http::StatusCode, Json};
-        #[derive(Serialize)]
-        struct ErrBody { error: String }
-        match self {
-            AppError::NotFound => (StatusCode::NOT_FOUND, Json(ErrBody { error: "not found".into() })).into_response(),
-            other => {
-                tracing::error!("internal error: {other:#}");
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrBody { error: "internal server error".into() })).into_response()
-            }
-        }
-    }
-}
-
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c().await.expect("install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        use tokio::signal::unix::{signal, SignalKind};
-        signal(SignalKind::terminate())
-            .expect("install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-
-    tracing::info!("shutting down");
+    // });
 }
