@@ -1,5 +1,6 @@
 use rand::prelude::*;
 use std::collections::HashMap;
+use rand::distributions::WeightedIndex;
 
 /// Markov-2 model: mempelajari transisi (prev2, prev1) -> next
 #[derive(Debug, Clone)]
@@ -31,6 +32,25 @@ impl Markov2 {
         }
     }
 
+    pub fn apply_decay(&mut self, factor: f64) {
+        // decay each count
+        let mut to_remove = Vec::new();
+        for (k, arr) in self.counts.iter_mut() {
+            let mut nonzero = false;
+            for x in arr.iter_mut() {
+                *x *= factor;
+                if *x >= 1e-6 { nonzero = true; } // threshold
+            }
+            if !nonzero {
+                to_remove.push(*k);
+            }
+        }
+        // prune empty contexts
+        for k in to_remove {
+            self.counts.remove(&k);
+        }
+    }
+
     pub fn update(&mut self, prev2: usize, prev1: usize, next: usize) {
         if prev2 >= 25 || prev1 >= 25 || next >= 25 {
             return;
@@ -41,59 +61,50 @@ impl Markov2 {
 
     /// Prediksi berbobot probabilistik top-k
     pub fn predict(&self, prev2: usize, prev1: usize, k: usize, temperature: f64) -> Vec<usize> {
-        let mut rng = thread_rng();
+        // temperature param sanity
         let temp = if temperature > 0.0 { temperature } else { 1.0 };
-        let mut probs = [self.alpha; 25];
-
+    
+        // build base probs (alpha + counts)
+        let mut base = [self.alpha; 25];
         if let Some(arr) = self.counts.get(&(prev2, prev1)) {
             for i in 0..25 {
-                probs[i] += arr[i];
+                base[i] += arr[i];
             }
+        } else {
+            // if no context, fallback to marginal sampling (use marginal_topk below)
+            return self.marginal_topk(k);
         }
-
-        // normalisasi
-        let sum: f64 = probs.iter().sum();
-        if sum == 0.0 {
-            // fallback acak
-            let mut out: Vec<usize> = (0..25).collect();
-            out.shuffle(&mut rng);
-            return out.into_iter().take(k).collect();
+    
+        // convert to probabilities and apply temperature: p_i = (base_i / sum)^(1/temp)
+        let sum: f64 = base.iter().sum();
+        if sum <= 0.0 {
+            return self.marginal_topk(k);
         }
-
-        // apply temperature
-        let mut scored: Vec<(usize, f64)> = probs
+        let mut scored: Vec<(usize, f64)> = base
             .iter()
             .enumerate()
-            .map(|(i, &v)| (i, (v / sum).powf(1.0 / temp)))
+            .map(|(i, &v)| {
+                let p = (v / sum).max(0.0);
+                (i, p.powf(1.0 / temp))
+            })
             .collect();
-
-        // normalisasi lagi
-        let total: f64 = scored.iter().map(|(_, p)| *p).sum();
-        for (_, p) in &mut scored {
-            *p /= total;
+    
+        // normalize again
+        let s: f64 = scored.iter().map(|(_, p)| *p).sum();
+        if s <= 0.0 {
+            return self.marginal_topk(k);
         }
-
-        // sort descending by probability
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-        // ambil top-n namun acak sedikit supaya variasi (tidak selalu 0..17)
-        let top_candidates: Vec<usize> = scored.iter().take(25).map(|(i, _)| *i).collect();
-        let mut selected = Vec::new();
-        for _ in 0..k {
-            let pick = top_candidates.choose(&mut rng).cloned().unwrap_or(0);
-            if !selected.contains(&pick) {
-                selected.push(pick);
-            }
-            if selected.len() >= k {
-                break;
-            }
+        for (_i, p) in scored.iter_mut() {
+            *p /= s;
         }
-
-        selected
+    
+        // sample k unique indices weighted by scored probabilities
+        sample_k_weighted_no_replace(&scored, k)
     }
 
     /// Marginal (fallback) kalau context tidak ada
     pub fn marginal_topk(&self, k: usize) -> Vec<usize> {
+        // build marginal
         let mut marginal = [self.alpha; 25];
         for arr in self.counts.values() {
             for i in 0..25 {
@@ -101,18 +112,46 @@ impl Markov2 {
             }
         }
         let sum: f64 = marginal.iter().sum();
-        if sum == 0.0 {
+        if sum <= 0.0 {
             let mut rng = thread_rng();
             let mut all: Vec<usize> = (0..25).collect();
             all.shuffle(&mut rng);
             return all.into_iter().take(k).collect();
         }
-        let mut idx_prob: Vec<(usize, f64)> = marginal
+        // apply temperature 1.0 (can be parameterized)
+        let mut scored: Vec<(usize, f64)> = marginal
             .iter()
             .enumerate()
-            .map(|(i, &p)| (i, p / sum))
+            .map(|(i, &v)| (i, v / sum))
             .collect();
-        idx_prob.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        idx_prob.iter().take(k).map(|(i, _)| *i).collect()
+    
+        sample_k_weighted_no_replace(&scored, k)
     }
+}
+
+pub fn sample_k_weighted_no_replace(probs: &[(usize, f64)], k: usize) -> Vec<usize> {
+    let mut rng = thread_rng();
+    // copy into vec for mutation
+    let mut items = probs.to_vec(); // Vec<(idx, prob)>
+    let mut out = Vec::with_capacity(k);
+
+    // if all probs zero -> uniform sample
+    if items.iter().all(|(_, p)| *p <= 0.0) {
+        let mut all: Vec<usize> = items.iter().map(|(i, _)| *i).collect();
+        all.shuffle(&mut rng);
+        all.truncate(k);
+        return all;
+    }
+
+    // iterative WeightedIndex; remove chosen each round
+    for _ in 0..k {
+        if items.is_empty() { break; }
+        let weights: Vec<f64> = items.iter().map(|(_, p)| *p).collect();
+        // safe WeightedIndex creation (non-zero check done)
+        let dist = WeightedIndex::new(weights).unwrap();
+        let pick_idx = dist.sample(&mut rng);
+        let (idx, _) = items.remove(pick_idx);
+        out.push(idx);
+    }
+    out
 }

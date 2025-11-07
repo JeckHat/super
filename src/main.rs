@@ -202,9 +202,6 @@ pub async fn update_data_system_all(connection: RpcClient) {
     // load last N rounds
     let mut history = load_history("output.txt");
     let last_n = 300usize;
-    if history.len() > last_n {
-        history = history.split_off(history.len() - last_n);
-    }
 
     // build Markov2 and train
     let mut mc = Markov2::new(1.0);
@@ -262,7 +259,7 @@ pub async fn update_data_system_all(connection: RpcClient) {
                 // produce prediction using Markov-2 if we have two previous observations
                 pred.clear();
                 if let (Some(a), Some(b)) = (last2, last1) {
-                    pred = mc.predict(a, b, 18, 1.0); // temperature 1.0 default
+                    pred = mc.predict(a, b, 18, 1.2); // temperature 1.0 default
                     if pred.len() < 18 {
                         // fill from marginal if needed
                         let mut fill = mc.marginal_topk(18);
@@ -280,7 +277,11 @@ pub async fn update_data_system_all(connection: RpcClient) {
                 pred.sort_unstable();
                 println!("Prediksi (0-based): {:?}", pred);
 
-                let amount = if lose > 0 { 10_000 * 10u64.pow(lose -1) } else { 10_000 };
+                // let base_amount: u64 = 10_000;
+                // let max_leverage: u32 = 5; // jangan pasang terlalu tinggi
+                // let leverage = std::cmp::min(lose as u32, max_leverage);
+                // let amount = base_amount.saturating_mul(2u64.saturating_pow(leverage));
+                let amount = if lose > 0 { 10_000 * 10.pow(lose -1) } else { 10_000 };
 
                 // deploy/ev logic (preserve previous behavior but use pred)
                 match fetch_ore_env(&connection, BOARD_ADDRESS, ore_api::id()).await {
@@ -382,7 +383,6 @@ pub async fn update_data_system_all(connection: RpcClient) {
                     println!("Prediksi  : {:?}", pred);
                     println!("Win Block : {}", winning_square);
                     println!("Hasil AI  : {}", if hit_pred { "✅ BENAR" } else { "❌ SALAH" });
-                    println!("Hasil ME  : {}", if hit_logic { "✅ BENAR" } else { "❌ SALAH" });
 
                     if hit_pred {
                         total_win_pred += 1.0;
@@ -396,8 +396,7 @@ pub async fn update_data_system_all(connection: RpcClient) {
                         total_win_logic += 1.0;
                     }
 
-                    println!("WR AI  : {:.2}%", ((total_win_pred as f64 / total as f64) * 100.0));
-                    println!("WR ME  : {:.2}%", ((total_win_logic as f64 / total as f64) * 100.0));
+                    println!("WR  : {:.2}%", ((total_win_pred as f64 / total as f64) * 100.0));
 
                     tokio::time::sleep(Duration::from_secs(20)).await;
 
@@ -422,6 +421,7 @@ pub async fn update_data_system_all(connection: RpcClient) {
 
                     // Update Markov with the observed transition
                     if let (Some(p2), Some(p1)) = (last2, last1) {
+                        mc.apply_decay(0.995);
                         mc.update(p2, p1, winning_square);
                     }
                     // shift history
