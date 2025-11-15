@@ -6,13 +6,25 @@ use axum::{
     Router,
 };
 use futures::{StreamExt, SinkExt};
+use serde::Serialize;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{RwLock, broadcast};
 use tracing::info;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerSnapshot {
+    pub r#type: &'static str,
+    pub status: String,
+    pub total_win: usize,
+    pub total_round: usize,
+    pub preds: Vec<usize>,
+    pub lost_in_arrow: usize,
+}
 
 #[derive(Clone)]
 pub struct WsServerHandle {
     pub tx: broadcast::Sender<String>,
+    pub snapshot: Arc<RwLock<Option<ServerSnapshot>>>,
 }
 
 pub fn build_router(handle: WsServerHandle) -> Router {
@@ -29,6 +41,13 @@ async fn handle_socket(socket: WebSocket, handle: Arc<WsServerHandle>) {
     info!("WS client connected");
     // split sink & stream
     let (mut sender, mut receiver) = socket.split();
+
+    if let Some(snap) = handle.snapshot.read().await.clone() {
+        if let Ok(json) = serde_json::to_string(&snap) {
+            // ignore send error (client may have closed)
+            let _ = sender.send(Message::Text(json.into())).await;
+        }
+    }
 
     // subscribe to broadcast channel
     let mut rx = handle.tx.subscribe();

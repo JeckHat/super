@@ -28,7 +28,8 @@ pub mod markov_chain;
 pub mod hmm2;
 pub mod ws_server;
 
-use crate::{app_state::{AppBoard, AppMiner, AppRound, AppState, AppTreasury}, database::{CreateDeployment, DbMinerSnapshot, DbTreasury, MinerLeaderboardRow, MinerOreLeaderboardRow, MinerTotalsRow, RoundRow, get_deployments_by_round}, hmm2::{predict_next_from_hmm, top_k_from_probs, train_hmm}, ore_env::fetch_ore_env, rpc::{DeployOutcome, evaluate_ev_only, infer_refined_ore, try_checkpoint_and_deploy, try_claim_sol}, ws_server::build_router};
+use crate::{app_state::{AppBoard, AppMiner, AppRound, AppState, AppTreasury}, database::{CreateDeployment, DbMinerSnapshot, DbTreasury, MinerLeaderboardRow, MinerOreLeaderboardRow, MinerTotalsRow, RoundRow, get_deployments_by_round}, hmm2::{predict_next_from_hmm, top_k_from_probs, train_hmm}, ore_env::fetch_ore_env, rpc::{DeployOutcome, evaluate_ev_only, infer_refined_ore, try_checkpoint_and_deploy, try_claim_sol}, ws_server::{WsServerHandle, build_router}};
+use crate::ws_server::ServerSnapshot;
 
 #[derive(serde::Serialize)]
 struct PredictionsMsg {
@@ -45,7 +46,8 @@ struct AccuracyMsg {
     status:  &'static str,
     accuracy: f64,
     total_round: usize,
-    total_win: usize
+    total_win: usize,
+    lost_in_arrow: usize
 }
 
 
@@ -59,7 +61,13 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().expect("Failed to load env");
 
     let (tx, _rx) = broadcast::channel::<String>(200);
-    let ws_handle = ws_server::WsServerHandle { tx: tx.clone() };
+    let snapshot: Arc<RwLock<Option<ws_server::ServerSnapshot>>> =
+        Arc::new(RwLock::new(None));
+
+    let ws_handle = ws_server::WsServerHandle {
+        tx: tx.clone(),
+        snapshot: snapshot.clone(),
+    };
 
     let app = build_router(ws_handle.clone());
 
@@ -145,8 +153,10 @@ async fn main() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
+    let handle_clone = ws_handle.clone();
+
     tokio::spawn(async move {
-        update_data_system_all(connection, history, tx.clone()).await;
+        update_data_system_all(connection, history, handle_clone).await;
     });
 
     // let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
@@ -166,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn update_data_system_all(connection: RpcClient, mut history: Vec<usize>, tx: broadcast::Sender<String>) {
+pub async fn update_data_system_all(connection: RpcClient, mut history: Vec<usize>, handle: WsServerHandle) {
     tracing::info!("Starting update_data_system (Markov-2)");
 
     let window = 50usize;
@@ -182,6 +192,8 @@ pub async fn update_data_system_all(connection: RpcClient, mut history: Vec<usiz
     let mut total = 0usize;
     let mut total_hit = 0usize;
     let mut preds: Vec<usize> = Vec::new();
+    let mut lost_in_arrow = 0;
+    let mut cur_lost_in_row = 0;
 
     let mut hmm_model = train_hmm(&history, n_states, n_iter);
     tracing::info!("Initial HMM trained on {} observations.", history.len());
@@ -223,11 +235,25 @@ pub async fn update_data_system_all(connection: RpcClient, mut history: Vec<usiz
             };
 
             if let Ok(json) = serde_json::to_string(&msg) {
-                let _ = tx.send(json);  // broadcast ke semua client
+                let _ = handle.tx.send(json);  // broadcast ke semua client
                 tracing::info!("Sent predictions via WS: {:?}", msg.preds);
             }
 
-            last_deployed_round = Some(board.round_id);
+            let snapshot = ServerSnapshot {
+                r#type: "snapshot",
+                status: "waiting".to_string(),
+                total_win: total_hit,
+                total_round: total,
+                preds: Vec::new(),
+                lost_in_arrow: lost_in_arrow
+            };
+    
+            {
+                let mut slot = handle.snapshot.write().await;
+                *slot = Some(snapshot.clone());
+
+                last_deployed_round = Some(board.round_id);
+            }
             // for path in &paths {
             //     match try_claim_sol(&connection, path).await {
             //         Ok(DeployOutcome::Deployed(sig)) => {
@@ -258,8 +284,22 @@ pub async fn update_data_system_all(connection: RpcClient, mut history: Vec<usiz
             };
 
             if let Ok(json) = serde_json::to_string(&msg) {
-                let _ = tx.send(json);  // broadcast ke semua client
+                let _ = handle.tx.send(json);  // broadcast ke semua client
                 tracing::info!("Sent predictions via WS: {:?}", msg.preds);
+            }
+
+            let snapshot = ServerSnapshot {
+                r#type: "snapshot",
+                status: "waiting".to_string(),
+                total_win: total_hit,
+                total_round: total,
+                preds: preds.clone(),
+                lost_in_arrow: lost_in_arrow
+            };
+            
+            {
+                let mut slot = handle.snapshot.write().await;
+                *slot = Some(snapshot.clone());
             }
 
             fn calc_amount_by_pair(start: u64, lose: u32) -> u64 {
@@ -365,20 +405,6 @@ pub async fn update_data_system_all(connection: RpcClient, mut history: Vec<usiz
                 println!("Top4 freq: {:?}", top4);
                 println!("Result: {} | WR: {:.2}% ({}/{})\n", if hit_pred { "✅" } else { "❌" }, wr, total_hit, total);
 
-                let msg = AccuracyMsg {
-                    r#type: "winning",
-                    preds: squares,
-                    status: "done",
-                    accuracy: wr,
-                    total_round: total,
-                    total_win: total_hit
-                };
-    
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    let _ = tx.send(json);  // broadcast ke semua client
-                    tracing::info!("Sent predictions via WS: {:?}", msg.preds);
-                }
-
                 if buffer.len() >= window { buffer.pop_front(); }
                 buffer.push_back(winning_square);
                 history.push(winning_square);
@@ -389,9 +415,47 @@ pub async fn update_data_system_all(connection: RpcClient, mut history: Vec<usiz
 
                 if hit_pred {
                     if lose > 0 { lose -= 1; }
+                    if cur_lost_in_row >= lost_in_arrow {
+                        lost_in_arrow = cur_lost_in_row;
+                    } 
+                    cur_lost_in_row = 0;
                 } else {
                     lose += 1;
+                    cur_lost_in_row += 1;
+                    if cur_lost_in_row >= lost_in_arrow {
+                        lost_in_arrow = cur_lost_in_row;
+                    }
                 }
+                let msg = AccuracyMsg {
+                    r#type: "winning",
+                    preds: squares,
+                    status: "done",
+                    accuracy: wr,
+                    total_round: total,
+                    total_win: total_hit,
+                    lost_in_arrow: lost_in_arrow
+                };
+    
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    let _ = handle.tx.send(json);  // broadcast ke semua client
+                    tracing::info!("Sent predictions via WS: {:?}", msg.preds);
+                }
+
+                
+                let snapshot = ServerSnapshot {
+                    r#type: "snapshot",
+                    status: "done".to_string(),
+                    total_win: total_hit,
+                    total_round: total,
+                    preds: preds.clone(),
+                    lost_in_arrow: lost_in_arrow
+                };
+        
+                {
+                    let mut slot = handle.snapshot.write().await;
+                    *slot = Some(snapshot.clone());
+                }
+
                 rounds_since_retrain += 1;
                 if rounds_since_retrain >= retrain_every {
                     rounds_since_retrain = 0;
@@ -400,7 +464,7 @@ pub async fn update_data_system_all(connection: RpcClient, mut history: Vec<usiz
                     hmm_model = train_hmm(train_seq, n_states, n_iter);
                     println!("Retrain done.");
                 }
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
                 let denom = round.deployed[winning_square];
                 if denom == 0 {
                     (Some(winning_square), None, Some(denom))
